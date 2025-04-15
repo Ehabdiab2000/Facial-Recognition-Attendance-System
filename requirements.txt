@@ -1,0 +1,7 @@
+PyQt6
+opencv-python
+face_recognition
+requests
+numpy
+dlib
+# RPi.GPIO # Optional, only needed on Pi
