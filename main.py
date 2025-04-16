@@ -30,39 +30,35 @@ logger = logging.getLogger(__name__)
 # --- Worker thread for blocking tasks like recognition and relay ---
 class Worker(QObject):
     finished = pyqtSignal()
-    # Signal to update UI with recognition results
-    recognition_result = pyqtSignal(list, list, bool) # face_locations, recognized_data, is_live
-    # Signal to update status message
-    status_update = pyqtSignal(str, str) # message, color ('black', 'green', 'red', 'orange')
+    # MODIFIED: Remove the bool for is_live
+    recognition_result = pyqtSignal(list, list) # face_locations, recognized_data
+    status_update = pyqtSignal(str, str)
 
     def __init__(self, face_processor: FaceProcessor):
         super().__init__()
         self.face_processor = face_processor
-        # No current_frame_rgb or frame_count needed here now
         logger.info("Worker object initialized.")
 
-    # Make process_this_frame the SLOT that does the work when signaled
-    @pyqtSlot(object, int) # Decorate as a slot
+    @pyqtSlot(object, int)
     def process_this_frame(self, frame_rgb, frame_count):
         """Processes the received frame and emits results."""
-        # Removed the mutex and _running flag logic
         if frame_rgb is None:
              logger.warning("Worker received None frame.")
              return
 
         try:
             logger.debug(f"Worker processing frame {frame_count}")
-            # Perform detection, liveness check, and recognition directly here
-            face_locations, recognized_data, is_live = self.face_processor.process_frame(
-                frame_rgb, frame_count
+            # MODIFIED: process_frame now returns only two values
+            face_locations, recognized_data = self.face_processor.process_frame(
+                frame_rgb, frame_count # Pass frame_count if needed by process_frame, otherwise remove
             )
-            # Emit results back to main thread for UI update
-            self.recognition_result.emit(face_locations, recognized_data, is_live)
+            # MODIFIED: Emit only the two results
+            self.recognition_result.emit(face_locations, recognized_data)
             logger.debug(f"Worker finished frame {frame_count}")
         except Exception as e:
             logger.error(f"Error during face processing in worker: {e}", exc_info=True)
-            # Emit status update on error
             self.status_update.emit(f"Processing Error: {e}", "red")
+
 
     # Remove the run(self) method entirely. The QThread's event loop will handle calling the slot.
     # def run(self): ... DELETE THIS METHOD ...
@@ -248,70 +244,64 @@ class MainWindow(QMainWindow):
         #     pass
 
 
-    def handle_recognition_result(self, face_locations, recognized_data, is_live):
+    # MODIFIED: Update signature - remove is_live parameter
+    def handle_recognition_result(self, face_locations, recognized_data):
         """Receives recognition results from worker thread and updates state/UI."""
         self.last_known_face_locations = face_locations
         self.last_recognized_data = recognized_data
 
-        identified = False
-        status_msg = "Status: Looking for faces..."
+        identified = False # Overall status for LED/Relay for this frame
+        status_msg = "Status: Looking for faces..." # Default message
         status_color = "black"
 
         current_time = datetime.now()
 
-        if recognized_data: # If any faces were processed (even unknown/not live)
-            if is_live:
-                found_match = False
-                for data in recognized_data:
-                    user_id = data['id']
-                    name = data['name']
+        # MODIFIED: Simplified logic - no is_live check
+        if recognized_data: # If any faces were processed
+            found_match = False
+            for data in recognized_data:
+                user_id = data['id']
+                name = data['name']
 
-                    if user_id is not None and name != config.UNKNOWN_PERSON_LABEL:
-                        found_match = True
-                        # --- Cooldown Check ---
-                        last_recog_time = self.last_recognition_details.get(user_id)
-                        if last_recog_time and (current_time - last_recog_time) < timedelta(seconds=config.RECOGNITION_COOLDOWN_SEC):
-                             logger.debug(f"User {name} (ID: {user_id}) is in cooldown period.")
-                             status_msg = f"Welcome back, {name}!" # Show welcome but don't re-trigger
-                             status_color = "green"
-                             identified = True # Still considered identified for LED
-                             continue # Skip triggering actions for this user
-
-
-                        # --- Actions for Newly Identified User ---
-                        logger.info(f"User Identified: {name} (ID: {user_id}, Distance: {data['distance']:.2f})")
-                        status_msg = f"Access Granted: Welcome, {name}!"
+                if user_id is not None and name != config.UNKNOWN_PERSON_LABEL:
+                    found_match = True
+                    # --- Cooldown Check ---
+                    last_recog_time = self.last_recognition_details.get(user_id)
+                    if last_recog_time and (current_time - last_recog_time) < timedelta(seconds=config.RECOGNITION_COOLDOWN_SEC):
+                        logger.debug(f"User {name} (ID: {user_id}) is in cooldown period.")
+                        status_msg = f"Welcome back, {name}!"
                         status_color = "green"
-                        identified = True
-                        self.last_recognition_details[user_id] = current_time # Update last recognition time
+                        identified = True # Still considered identified for LED
+                        continue # Skip triggering actions for this user
 
-                        # 1. Log Transaction
-                        transaction_id = self.db_manager.add_transaction(user_id)
-                        if transaction_id:
-                            # 2. Queue for Network Send
-                            self.network_manager.queue_transaction(transaction_id)
+                    # --- Actions for Newly Identified User ---
+                    logger.info(f"User Identified: {name} (ID: {user_id}, Distance: {data['distance']:.2f})")
+                    status_msg = f"Access Granted: Welcome, {name}!"
+                    status_color = "green"
+                    identified = True
+                    self.last_recognition_details[user_id] = current_time # Update last recognition time
 
-                        # 3. Activate Relay (in a separate thread to avoid blocking)
-                        # Use QTimer.singleShot or another thread for HW actions
-                        QTimer.singleShot(0, hw.activate_relay) # Runs activate_relay in the event loop briefly
+                    # 1. Log Transaction
+                    transaction_id = self.db_manager.add_transaction(user_id)
+                    if transaction_id:
+                        # 2. Queue for Network Send
+                        self.network_manager.queue_transaction(transaction_id)
 
-                        # Break after first successful identification or process all? Process all for now.
-                        # break # Uncomment if only one person should trigger door per frame
+                    # 3. Activate Relay
+                    QTimer.singleShot(0, hw.activate_relay)
 
-                if not found_match:
-                     # Live face(s) detected, but none matched known users
-                     status_msg = "Status: Unknown face detected."
-                     status_color = "orange"
-                     identified = False # Treat unknown as not identified for door/LED
-            else:
-                # Liveness check failed
-                status_msg = "Status: Please look directly at the camera (Liveness check failed)."
-                status_color = "orange"
-                identified = False
+                    # Consider if you want to break after the first match
+                    # break
 
-        # Update status label and LED based on whether *any* valid identification occurred
+            if not found_match and face_locations: # Check face_locations too, as recognized_data might just contain unknowns
+                 # Faces detected, but none matched known users
+                 status_msg = "Status: Unknown face detected."
+                 status_color = "orange" # Keep orange for unknown
+                 identified = False
+
+        # Update status label and LED
         self.update_status_label(status_msg, status_color)
-        hw.set_led_status(identified) # Update hardware LED
+        hw.set_led_status(identified)
 
         # Trigger a display update with the new boxes/names
         if self.current_primary_frame is not None:
@@ -338,18 +328,15 @@ class MainWindow(QMainWindow):
                 left = int(left * scale_x)
 
                 name = config.UNKNOWN_PERSON_LABEL
-                color = (0, 0, 255) # Red for unknown/failed liveness
+                color = (0, 0, 255) # Red for unknown
 
                 if i < len(self.last_recognized_data):
                     recog_data = self.last_recognized_data[i]
                     name = recog_data['name']
-                    if recog_data['id'] is not None and not "Liveness?" in name:
+                    if recog_data['id'] is not None:
                          color = (0, 255, 0) # Green for known
                          # Add distance to name for debugging?
                          # name += f" ({recog_data['distance']:.2f})"
-                    elif "Liveness?" in name:
-                         color = (0, 165, 255) # Orange for failed liveness
-
 
                 # Draw rectangle around the face
                 cv2.rectangle(display_frame, (left, top), (right, bottom), color, 2)
