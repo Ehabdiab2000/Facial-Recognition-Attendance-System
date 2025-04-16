@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QSizePolicy)
 from PyQt6.QtGui import QPixmap, QImage, QFont, QColor, QPainter
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QMutex, QMutexLocker
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QMutex, QMutexLocker , pyqtSlot
 
 # Import project modules
 import config
@@ -38,64 +38,45 @@ class Worker(QObject):
     def __init__(self, face_processor: FaceProcessor):
         super().__init__()
         self.face_processor = face_processor
-        self._running = False
-        self.current_frame_rgb = None
-        self.frame_count = 0
-        self._mutex = QMutex()
+        # No current_frame_rgb or frame_count needed here now
+        logger.info("Worker object initialized.")
 
+    # Make process_this_frame the SLOT that does the work when signaled
+    @pyqtSlot(object, int) # Decorate as a slot
     def process_this_frame(self, frame_rgb, frame_count):
-        """Stores the frame for processing."""
-        with QMutexLocker(self._mutex):
-             self.current_frame_rgb = frame_rgb
-             self.frame_count = frame_count
-             self._running = True # Ensure the loop runs at least once
+        """Processes the received frame and emits results."""
+        # Removed the mutex and _running flag logic
+        if frame_rgb is None:
+             logger.warning("Worker received None frame.")
+             return
 
-    def run(self):
-        """The actual processing loop running in a separate thread."""
-        while True:
-             frame_to_process = None
-             count_to_process = 0
-             with QMutexLocker(self._mutex):
-                  if not self._running or self.current_frame_rgb is None:
-                       # If stopped or no frame, break (or sleep?)
-                       # Let's make it run once per frame provided
-                       self._running = False # Reset flag after processing
-                       break
+        try:
+            logger.debug(f"Worker processing frame {frame_count}")
+            # Perform detection, liveness check, and recognition directly here
+            face_locations, recognized_data, is_live = self.face_processor.process_frame(
+                frame_rgb, frame_count
+            )
+            # Emit results back to main thread for UI update
+            self.recognition_result.emit(face_locations, recognized_data, is_live)
+            logger.debug(f"Worker finished frame {frame_count}")
+        except Exception as e:
+            logger.error(f"Error during face processing in worker: {e}", exc_info=True)
+            # Emit status update on error
+            self.status_update.emit(f"Processing Error: {e}", "red")
 
-                  # Get the frame to process
-                  frame_to_process = self.current_frame_rgb.copy()
-                  count_to_process = self.frame_count
-                  self.current_frame_rgb = None # Clear frame after copying
+    # Remove the run(self) method entirely. The QThread's event loop will handle calling the slot.
+    # def run(self): ... DELETE THIS METHOD ...
 
-             if frame_to_process is not None:
-                  try:
-                       logger.debug(f"Worker processing frame {count_to_process}")
-                       # Perform detection, liveness check, and recognition
-                       face_locations, recognized_data, is_live = self.face_processor.process_frame(
-                           frame_to_process, count_to_process
-                       )
-                       # Emit results back to main thread for UI update
-                       self.recognition_result.emit(face_locations, recognized_data, is_live)
-                       logger.debug(f"Worker finished frame {count_to_process}")
-                  except Exception as e:
-                       logger.error(f"Error during face processing in worker: {e}", exc_info=True)
-                       self.status_update.emit(f"Processing Error: {e}", "red")
-             else:
-                 # Should not happen with current logic, but good to handle
-                 logger.warning("Worker run loop executed without a frame.")
-                 break # Exit if something went wrong
+    # Remove the stop(self) method, it's not needed for this slot-based approach
+    # def stop(self): ... DELETE THIS METHOD ...
 
-
-        logger.debug("Worker run finished for this cycle.")
-        # self.finished.emit() # Don't emit finished unless the thread is truly done
-
-    def stop(self):
-         with QMutexLocker(self._mutex):
-              self._running = False
-              self.current_frame_rgb = None
 
 
 class MainWindow(QMainWindow):
+
+    # We need a way to trigger the worker's run method
+        # Let's use a signal from the main thread when a frame is ready to be processed
+    request_processing = pyqtSignal(object, int)
     def __init__(self):
         super().__init__()
         self.setWindowTitle(config.APP_TITLE)
@@ -121,19 +102,28 @@ class MainWindow(QMainWindow):
 
         # --- Setup Worker Thread for Processing ---
         self.worker_thread = QThread(self)
-        self.worker = Worker(self.face_processor)
-        self.worker.moveToThread(self.worker_thread)
+        self.worker = Worker(self.face_processor) # Worker object created
+        self.worker.moveToThread(self.worker_thread) # Worker moved to thread
+
 
         # Connect signals/slots for worker
+        # These connections emit signals FROM the worker TO the main thread (MainWindow)
         self.worker.recognition_result.connect(self.handle_recognition_result)
         self.worker.status_update.connect(self.update_status_label)
+        # This connection emits signals FROM the main thread TO the worker's slot
+        self.request_processing.connect(self.worker.process_this_frame)
+
+        # Optional: Connect thread finished signals for cleanup
+        self.worker_thread.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+
+        self.worker_thread.start() # Start the thread's event loop
+        logger.info("Worker thread started.")
         # self.worker.finished.connect(self.worker_thread.quit) # Maybe manage thread lifecycle differently
         # self.worker.finished.connect(self.worker.deleteLater)
         # self.worker_thread.finished.connect(self.worker_thread.deleteLater)
 
-        # We need a way to trigger the worker's run method
-        # Let's use a signal from the main thread when a frame is ready to be processed
-        self.request_processing = pyqtSignal(object, int)
+        
         self.request_processing.connect(self.worker.process_this_frame)
 
         self.worker_thread.start()
@@ -244,19 +234,14 @@ class MainWindow(QMainWindow):
                 self.last_frame_time = current_time
                 self.frame_counter += 1
 
-                # Convert frame to RGB for face_recognition library
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # Resize for performance before sending to worker
                 frame_rgb_small = cv2.resize(frame_rgb, (config.FRAME_WIDTH, config.FRAME_HEIGHT))
 
-                # Send the small frame to the worker thread for processing
-                # Need to ensure worker is ready or queue requests?
-                # For now, just emit the signal. Worker handles one frame at a time.
-                self.request_processing.emit(frame_rgb_small, self.frame_counter)
+                # Emit the signal to trigger the worker's process_this_frame slot
+                self.request_processing.emit(frame_rgb_small, self.frame_counter) # <--- Triggers worker
 
-
-            # --- Display Update (always update display, even if not processed) ---
-            self.display_frame(frame) # Display the original res frame
+            # --- Display Update (always update display) ---
+            self.display_frame(frame)# Display the original res frame
 
         # elif camera_index == config.SECONDARY_CAMERA_INDEX:
         #     # Handle secondary camera frame (e.g., display in a corner, use for liveness)
@@ -458,12 +443,10 @@ class MainWindow(QMainWindow):
         # 1. Stop worker thread
         if self.worker_thread.isRunning():
             logger.info("Stopping worker thread...")
-            # Signal the worker's loop to stop if it's complex, or just quit the thread
-            self.worker.stop() # Add a stop method if needed
-            self.worker_thread.quit()
+            # self.worker.stop() # No longer needed
+            self.worker_thread.quit() # Ask the thread's event loop to exit
             if not self.worker_thread.wait(3000): # Wait 3 sec
                  logger.warning("Worker thread did not quit gracefully.")
-                 self.worker_thread.terminate()
 
 
         # 2. Stop camera threads

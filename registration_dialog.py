@@ -3,8 +3,9 @@ import cv2
 import numpy as np
 import config
 import logging
+import face_recognition
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-                             QPushButton, QMessageBox, QWidget)
+                             QPushButton, QMessageBox, QWidget,QApplication)
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 
