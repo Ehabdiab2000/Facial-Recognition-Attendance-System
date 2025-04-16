@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timedelta
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QHBoxLayout, QLabel, QPushButton, QSizePolicy)
+                            QHBoxLayout, QLabel, QPushButton, QSizePolicy, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QMessageBox)
 from PyQt6.QtGui import QPixmap, QImage, QFont, QColor, QPainter
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QMutex, QMutexLocker , pyqtSlot
 
@@ -19,6 +19,8 @@ from network_manager import NetworkManager
 from face_processor import FaceProcessor
 from camera_thread import CameraThread
 from registration_dialog import RegistrationDialog
+# Import the new settings dialog
+from settings_dialog import SettingsDialog
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, # Change to DEBUG for more detail
@@ -92,6 +94,8 @@ class MainWindow(QMainWindow):
         self.current_primary_frame = None # Store latest frame from primary cam
         self.last_recognition_details = {} # Store last recognition time per user ID
         self.processing_active = True # Flag to control processing
+        self.recognition_paused_until = None # Timestamp until which recognition is paused
+        self.welcome_message_box = None # To hold the temporary message box
 
         # --- Setup UI Elements ---
         self._setup_ui()
@@ -108,23 +112,8 @@ class MainWindow(QMainWindow):
         self.worker.status_update.connect(self.update_status_label)
         # This connection emits signals FROM the main thread TO the worker's slot
         self.request_processing.connect(self.worker.process_this_frame)
-
-        # Optional: Connect thread finished signals for cleanup
-        self.worker_thread.finished.connect(self.worker.deleteLater)
-        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
-
         self.worker_thread.start() # Start the thread's event loop
         logger.info("Worker thread started.")
-        # self.worker.finished.connect(self.worker_thread.quit) # Maybe manage thread lifecycle differently
-        # self.worker.finished.connect(self.worker.deleteLater)
-        # self.worker_thread.finished.connect(self.worker_thread.deleteLater)
-
-        
-        self.request_processing.connect(self.worker.process_this_frame)
-
-        self.worker_thread.start()
-        logger.info("Worker thread started.")
-
 
         # --- Setup Camera Threads ---
         self.camera_threads = {}
@@ -139,6 +128,19 @@ class MainWindow(QMainWindow):
         self.ui_update_timer.timeout.connect(self.update_ui_elements)
         self.ui_update_timer.start(1000) # Update FPS once per second
 
+    def open_registration_dialog(self):
+        """Pauses processing and opens the registration dialog."""
+        logger.info("Opening registration dialog.")
+        self.processing_active = False # Pause processing
+        self.stop_all_cameras() # Stop main cameras before opening dialog's camera
+
+        # Ensure RegistrationDialog and its dependencies are imported
+        from registration_dialog import RegistrationDialog # Moved import here
+
+        dialog = RegistrationDialog(self.db_manager, self.face_processor, self)
+        dialog.user_registered.connect(self.on_user_registered) # Connect signal
+        dialog.finished.connect(self.on_registration_dialog_closed) # Signal for when dialog closes
+        dialog.exec() # Show dialog modally
 
     def _setup_ui(self):
         self.central_widget = QWidget()
@@ -173,6 +175,10 @@ class MainWindow(QMainWindow):
         self.register_button.clicked.connect(self.open_registration_dialog)
         button_layout.addWidget(self.register_button)
 
+        self.settings_button = QPushButton("Settings") # Add settings button
+        self.settings_button.clicked.connect(self.open_settings_dialog)
+        button_layout.addWidget(self.settings_button)
+
         # Add more buttons if needed (e.g., Settings, Shutdown)
         self.quit_button = QPushButton("Quit")
         self.quit_button.clicked.connect(self.close)
@@ -193,6 +199,35 @@ class MainWindow(QMainWindow):
         self.camera_threads[index] = thread
         logger.info(f"Camera thread for index {index} started.")
 
+    def show_temporary_message(self, title, text, duration_ms=3000):
+        """Displays a non-blocking message box that closes automatically."""
+        if self.welcome_message_box and self.welcome_message_box.isVisible():
+            self.welcome_message_box.close() # Close previous one if still open
+
+        self.welcome_message_box = QMessageBox(self)
+        self.welcome_message_box.setIcon(QMessageBox.Icon.Information)
+        self.welcome_message_box.setWindowTitle(title)
+        self.welcome_message_box.setText(text)
+        self.welcome_message_box.setStandardButtons(QMessageBox.StandardButton.NoButton) # No buttons
+        self.welcome_message_box.setModal(False) # Non-blocking
+        # Position it somewhere reasonable, e.g., top center
+        screen_geometry = QApplication.primaryScreen().geometry()
+        msg_box_size = self.welcome_message_box.sizeHint()
+        self.welcome_message_box.move(int((screen_geometry.width() - msg_box_size.width()) / 2), 50)
+        self.welcome_message_box.show()
+        QTimer.singleShot(duration_ms, self.welcome_message_box.close) # Auto-close
+
+    def open_settings_dialog(self):
+        """Opens the system settings dialog."""
+        # Pause processing while settings are open?
+        # self.processing_active = False # Consider implications
+        dialog = SettingsDialog(self) # Pass parent
+        dialog.exec() # Show modally
+        # Reload config or notify components if needed after save
+        # self.processing_active = True
+        logger.info("Settings dialog closed.")
+        # Potentially re-apply some settings immediately if needed
+        # e.g., self.face_processor.load_known_faces() if threshold changed?
 
     def stop_all_cameras(self):
         logger.info("Stopping all camera threads...")
@@ -210,193 +245,224 @@ class MainWindow(QMainWindow):
               del self.camera_threads[index] # Remove from active threads
 
 
-    def handle_camera_error(self, error_msg, index):
-        logger.error(f"Camera {index} Error: {error_msg}")
-        self.update_status_label(f"Camera {index} Error: {error_msg}", "red")
-        # Optionally try to restart the camera thread after a delay
-        if index in self.camera_threads:
-             del self.camera_threads[index] # Remove faulty thread
-        # QTimer.singleShot(5000, lambda: self.start_camera(index, config.FPS_LIMIT)) # Retry after 5s
+    def handle_frame(self, frame, cam_index):
+        """Handles incoming frames from camera threads."""
+        if cam_index == config.PRIMARY_CAMERA_INDEX:
+            self.current_primary_frame = frame # Keep latest frame
+            now = time.time()
 
+            # Check if recognition is paused
+            if self.recognition_paused_until and now < self.recognition_paused_until:
+                # Still paused, update display but don't process
+                self.update_video_display(frame, self.last_known_face_locations, self.last_recognized_data, paused=True)
+                return # Skip processing
+            else:
+                # Pause finished or wasn't active
+                self.recognition_paused_until = None
 
-    def handle_frame(self, frame, camera_index):
-        """Receives frame from any camera thread."""
-        if camera_index == config.PRIMARY_CAMERA_INDEX:
-            self.current_primary_frame = frame # Store the latest primary frame
-            # --- Frame Processing Trigger ---
-            current_time = time.time()
-            # Limit processing frequency
-            if self.processing_active and (current_time - self.last_frame_time >= 1.0 / config.FPS_LIMIT):
-                self.last_frame_time = current_time
+            # Throttle processing based on FPS limit
+            if self.processing_active and (now - self.last_frame_time >= 1.0 / config.FPS_LIMIT):
+                self.last_frame_time = now
                 self.frame_counter += 1
-
+                logger.debug(f"Requesting processing for frame {self.frame_counter}")
+                # Convert frame to RGB for face_recognition library
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_rgb_small = cv2.resize(frame_rgb, (config.FRAME_WIDTH, config.FRAME_HEIGHT))
+                # Emit signal to worker thread
+                self.request_processing.emit(frame_rgb, self.frame_counter)
 
-                # Emit the signal to trigger the worker's process_this_frame slot
-                self.request_processing.emit(frame_rgb_small, self.frame_counter) # <--- Triggers worker
+            # Always update the display with the latest frame and last known results
+            self.update_video_display(frame, self.last_known_face_locations, self.last_recognized_data)
 
-            # --- Display Update (always update display) ---
-            self.display_frame(frame)# Display the original res frame
-
-        # elif camera_index == config.SECONDARY_CAMERA_INDEX:
-        #     # Handle secondary camera frame (e.g., display in a corner, use for liveness)
+        # Handle secondary camera frame if needed (e.g., display in a corner)
+        # elif cam_index == config.SECONDARY_CAMERA_INDEX:
         #     pass
+
+    @pyqtSlot(str, int) # Decorator ensures it runs in the main thread
+    def handle_camera_error(self, error_msg, cam_index):
+        logger.error(f"Camera {cam_index} Error: {error_msg}")
+        self.update_status_label(f"Camera {cam_index} Error: {error_msg}", "red")
+        # Optionally try to restart the camera thread after a delay
+        if cam_index in self.camera_threads:
+            del self.camera_threads[cam_index] # Remove faulty thread
+        # QTimer.singleShot(5000, lambda: self.start_camera(cam_index, config.FPS_LIMIT)) # Retry after 5s
 
 
     # MODIFIED: Update signature - remove is_live parameter
+    @pyqtSlot(list, list) # Decorator ensures it runs in the main thread
     def handle_recognition_result(self, face_locations, recognized_data):
-        """Receives recognition results from worker thread and updates state/UI."""
+        """Handles the results from the worker thread."""
+        logger.debug(f"Received recognition result: {len(face_locations)} faces, {len(recognized_data)} recognized.")
         self.last_known_face_locations = face_locations
         self.last_recognized_data = recognized_data
 
-        identified = False # Overall status for LED/Relay for this frame
-        status_msg = "Status: Looking for faces..." # Default message
-        status_color = "black"
+        now = datetime.now()
+        status_text = "Status: Monitoring..."
+        status_color = "white"
 
-        current_time = datetime.now()
+        found_known_person = False
+        for i, data in enumerate(recognized_data):
+            user_id = data.get('id')
+            name = data.get('name', config.UNKNOWN_PERSON_LABEL)
+            distance = data.get('distance', 1.0)
 
-        # MODIFIED: Simplified logic - no is_live check
-        if recognized_data: # If any faces were processed
-            found_match = False
-            for data in recognized_data:
-                user_id = data['id']
-                name = data['name']
+            if user_id is not None and name != config.UNKNOWN_PERSON_LABEL:
+                found_known_person = True
+                last_seen = self.last_recognition_details.get(user_id)
 
-                if user_id is not None and name != config.UNKNOWN_PERSON_LABEL:
-                    found_match = True
-                    # --- Cooldown Check ---
-                    last_recog_time = self.last_recognition_details.get(user_id)
-                    if last_recog_time and (current_time - last_recog_time) < timedelta(seconds=config.RECOGNITION_COOLDOWN_SEC):
-                        logger.debug(f"User {name} (ID: {user_id}) is in cooldown period.")
-                        status_msg = f"Welcome back, {name}!"
-                        status_color = "green"
-                        identified = True # Still considered identified for LED
-                        continue # Skip triggering actions for this user
+                # Check cooldown
+                if last_seen is None or (now - last_seen) > timedelta(seconds=config.RECOGNITION_COOLDOWN_SEC):
+                    status_text = f"Welcome, {name}! (Dist: {distance:.2f})"
+                    status_color = "lime"
+                    logger.info(f"Recognized {name} (ID: {user_id}). Logging attendance.")
+                    self.last_recognition_details[user_id] = now
 
-                    # --- Actions for Newly Identified User ---
-                    logger.info(f"User Identified: {name} (ID: {user_id}, Distance: {data['distance']:.2f})")
-                    status_msg = f"Access Granted: Welcome, {name}!"
-                    status_color = "green"
-                    identified = True
-                    self.last_recognition_details[user_id] = current_time # Update last recognition time
-
-                    # 1. Log Transaction
+                    # --- Trigger Actions --- #
+                    # 1. Log attendance (network)
+                    # self.network_manager.log_attendance(user_id, name) # Incorrect call
                     transaction_id = self.db_manager.add_transaction(user_id)
                     if transaction_id:
-                        # 2. Queue for Network Send
+                        # Optionally, immediately queue for faster upload attempt (NetworkManager also polls DB)
                         self.network_manager.queue_transaction(transaction_id)
+                    else:
+                        logger.error(f"Failed to log transaction for user {user_id} in the database.")
+                        self.update_status_label(f"DB Error logging {name}", "red")
 
-                    # 3. Activate Relay
-                    QTimer.singleShot(0, hw.activate_relay)
+                    # 2. Activate hardware (relay/LED)
+                    hw.activate_relay()
+                    hw.set_led_status(True) # Green ON, Red OFF
+                    # Schedule LED off after door duration (revert to default Red ON)
+                    QTimer.singleShot(config.DOOR_OPEN_DURATION_SEC * 1000, lambda: hw.set_led_status(False))
+                    # 3. Show temporary welcome message
+                    self.show_temporary_message("Welcome!", f"Hello, {name}!", duration_ms=3000)
+                    # 4. Pause recognition process
+                    self.recognition_paused_until = time.time() + 4.0 # Pause for 4 seconds
+                    logger.info("Recognition paused for 4 seconds.")
+                    # Update display immediately to show pause state if needed
+                    if self.current_primary_frame is not None:
+                         self.update_video_display(self.current_primary_frame, face_locations, recognized_data, paused=True)
+                    break # Process only the first recognized person fully for welcome message/pause
 
-                    # Consider if you want to break after the first match
-                    # break
+                else:
+                    # Recognized but within cooldown
+                    status_text = f"Recognized: {name} (Cooldown)"
+                    status_color = "yellow"
+                    logger.debug(f"Recognized {name} (ID: {user_id}) within cooldown period.")
+                    # Optionally flash green LED briefly?
+                    # hw.set_led('green', True)
+                    # QTimer.singleShot(200, lambda: hw.set_led('green', False))
 
-            if not found_match and face_locations: # Check face_locations too, as recognized_data might just contain unknowns
-                 # Faces detected, but none matched known users
-                 status_msg = "Status: Unknown face detected."
-                 status_color = "orange" # Keep orange for unknown
-                 identified = False
+            elif name == config.UNKNOWN_PERSON_LABEL:
+                status_text = f"Unknown Person Detected (Closest Dist: {distance:.2f})"
+                status_color = "orange"
+                hw.set_led_status(False) # Red ON, Green OFF for unknown
+                # QTimer.singleShot(1000, lambda: hw.set_led('red', False)) # Turn off after 1 sec - REMOVED as next frame handles state
 
-        # Update status label and LED
-        self.update_status_label(status_msg, status_color)
-        hw.set_led_status(identified)
+        if not face_locations:
+            status_text = "Status: Monitoring... No faces detected."
+            status_color = "white"
+            hw.set_led_status(False) # Ensure default state (Red ON) if no faces
 
-        # Trigger a display update with the new boxes/names
-        if self.current_primary_frame is not None:
-            self.display_frame(self.current_primary_frame)
+        self.update_status_label(status_text, status_color)
+
+        # Display update is handled by handle_frame
+        # if self.current_primary_frame is not None and not self.recognition_paused_until:
+        #      self.update_video_display(self.current_primary_frame, face_locations, recognized_data)
 
 
-    def display_frame(self, frame):
-        """Displays the frame in the video label, drawing boxes and names."""
+    # This method is now primarily called by handle_frame
+    # It still needs the @pyqtSlot decorator if connected to signals, but it's not directly connected anymore.
+    # Keeping the decorator doesn't hurt, but it's not strictly necessary for its current usage.
+    @pyqtSlot(str, str) # Decorator ensures it runs in the main thread
+    def update_video_display(self, frame, face_locations, recognized_data, paused=False):
+        """Updates the video label with the frame and drawn boxes/names."""
         try:
             display_frame = frame.copy()
             h, w, _ = display_frame.shape
 
-            # Scale locations from processing size back to original frame size
-            proc_h, proc_w = config.FRAME_HEIGHT, config.FRAME_WIDTH
-            scale_y = h / proc_h
-            scale_x = w / proc_w
-
-            # Draw boxes and names based on the *last known results*
-            for i, (top, right, bottom, left) in enumerate(self.last_known_face_locations):
-                # Scale coordinates
-                top = int(top * scale_y)
-                right = int(right * scale_x)
-                bottom = int(bottom * scale_y)
-                left = int(left * scale_x)
-
+            # Draw rectangles and names
+            for i, (top, right, bottom, left) in enumerate(face_locations):
+                color = (0, 0, 255) # Red for unknown by default
                 name = config.UNKNOWN_PERSON_LABEL
-                color = (0, 0, 255) # Red for unknown
+                if i < len(recognized_data):
+                    rec_data = recognized_data[i]
+                    name = rec_data.get('name', config.UNKNOWN_PERSON_LABEL)
+                    user_id = rec_data.get('id')
+                    if user_id is not None:
+                        # Check if within cooldown for display purposes
+                        last_seen = self.last_recognition_details.get(user_id)
+                        if last_seen and (datetime.now() - last_seen) < timedelta(seconds=config.RECOGNITION_COOLDOWN_SEC):
+                             color = (0, 255, 255) # Yellow for recognized but cooldown
+                        else:
+                             color = (0, 255, 0) # Green for recognized
+                    elif name != config.UNKNOWN_PERSON_LABEL: # Should have ID, but fallback
+                         color = (0, 255, 0)
 
-                if i < len(self.last_recognized_data):
-                    recog_data = self.last_recognized_data[i]
-                    name = recog_data['name']
-                    if recog_data['id'] is not None:
-                         color = (0, 255, 0) # Green for known
-                         # Add distance to name for debugging?
-                         # name += f" ({recog_data['distance']:.2f})"
-
-                # Draw rectangle around the face
+                # Draw rectangle
                 cv2.rectangle(display_frame, (left, top), (right, bottom), color, 2)
 
-                # Draw label with name below the face
-                # Ensure text stays within frame boundaries
-                text_y = bottom + 25 if bottom + 25 < h else top - 10
-                cv2.rectangle(display_frame, (left, bottom - 20), (right, bottom), color, cv2.FILLED)
-                font = cv2.FONT_HERSHEY_DUPLEX
-                cv2.putText(display_frame, name, (left + 6, bottom - 6), font, 0.6, (255, 255, 255), 1)
+                # Draw label
+                label = f"{name}"
+                if name != config.UNKNOWN_PERSON_LABEL and i < len(recognized_data):
+                     distance = recognized_data[i].get('distance', 1.0)
+                     label += f" ({distance:.2f})"
 
-            # Convert frame to QPixmap for display
+                # Text background
+                (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                cv2.rectangle(display_frame, (left, bottom - text_height - baseline - 5), (left + text_width, bottom), color, cv2.FILLED)
+                # Text itself
+                cv2.putText(display_frame, label, (left + 3, bottom - baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+
+            # Add "Paused" overlay if needed
+            if paused:
+                overlay_color = (0, 0, 0, 180) # Semi-transparent black
+                text_color = (255, 255, 255, 255) # White
+                font_scale = 1.5
+                thickness = 2
+                text = "Recognition Paused"
+                (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                text_x = int((w - text_w) / 2)
+                text_y = int((h + text_h) / 2)
+                # Create overlay rectangle (using numpy for potential alpha blending if needed)
+                sub_img = display_frame[text_y - text_h - 10:text_y + 10, text_x - 10:text_x + text_w + 10]
+                white_rect = np.ones(sub_img.shape, dtype=np.uint8) * 0 # Black background
+                alpha = 0.7 # Transparency factor
+                res = cv2.addWeighted(sub_img, alpha, white_rect, 1-alpha, 1.0)
+                display_frame[text_y - text_h - 10:text_y + 10, text_x - 10:text_x + text_w + 10] = res
+                # Put text on overlay
+                cv2.putText(display_frame, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color[:3], thickness, cv2.LINE_AA)
+
+
+            # Convert frame to QPixmap
             rgb_image = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-            qt_image = QImage(rgb_image.data, w, h, rgb_image.strides[0], QImage.Format.Format_RGB888)
+            h, w, ch = rgb_image.shape
+            bytes_per_line = ch * w
+            qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
             pixmap = QPixmap.fromImage(qt_image)
-
-            # Scale pixmap to fit label while maintaining aspect ratio
             self.video_label.setPixmap(pixmap.scaled(self.video_label.size(),
-                                                      Qt.AspectRatioMode.KeepAspectRatio,
-                                                      Qt.TransformationMode.SmoothTransformation))
+                                                    Qt.AspectRatioMode.KeepAspectRatio,
+                                                    Qt.TransformationMode.SmoothTransformation))
         except Exception as e:
-            logger.error(f"Error displaying frame: {e}", exc_info=True)
-            # Optionally display an error image or message on the label
+            logger.error(f"Error updating video display: {e}", exc_info=True)
+            # Optionally display error on label itself
+            # painter = QPainter(self.video_label.pixmap())
+            # painter.setPen(QColor("red"))
+            # painter.drawText(10, 30, f"Display Error: {e}")
+            # painter.end()
 
-
-    def update_status_label(self, message, color_name="black"):
+    @pyqtSlot(str, str) # Decorator ensures it runs in the main thread
+    def update_status_label(self, text, color="white"):
         """Updates the status label text and color."""
-        self.status_label.setText(message)
-        color_map = {
-            "black": "#000000",
-            "green": "#00AA00",
-            "red": "#AA0000",
-            "orange": "#FFA500",
-            "blue": "#0000AA",
-        }
-        self.status_label.setStyleSheet(f"color: {color_map.get(color_name, '#000000')};")
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color};")
 
     def update_ui_elements(self):
-        """Periodically update elements like FPS."""
-        # Calculate FPS (Simple average over the last second)
-        # Note: self.frame_counter increments when a frame is *sent* for processing
-        # A more accurate FPS would measure frames *displayed* or *received*
-        # This FPS reflects processing rate, not camera rate.
-        # Resetting frame counter logic might be needed depending on desired FPS metric.
-        # For now, just display a placeholder or a simple count.
-        # self.fps_label.setText(f"Processed FPS: {self.frame_counter}") # Needs reset logic
-        self.fps_label.setText(f"Time: {datetime.now():%H:%M:%S}") # Display time instead
-
-
-    def open_registration_dialog(self):
-        """Pauses processing and opens the registration dialog."""
-        logger.info("Opening registration dialog.")
-        self.processing_active = False # Pause processing
-        self.stop_all_cameras() # Stop main cameras before opening dialog's camera
-
-        dialog = RegistrationDialog(self.db_manager, self.face_processor, self)
-        dialog.user_registered.connect(self.on_user_registered) # Connect signal
-        dialog.finished.connect(self.on_registration_dialog_closed) # Signal for when dialog closes
-        dialog.exec() # Show dialog modally
-
+        """Periodically updates UI elements like FPS."""
+        # Calculate FPS (simple average over the last second)
+        # More sophisticated FPS calculation might be needed
+        # This is just a placeholder
+        self.fps_label.setText(f"FPS: {self.frame_counter}") # Assuming frame_counter resets or is handled elsewhere
+        # Reset frame counter for the next second? Depends on how FPS is calculated.
+        # self.frame_counter = 0 # If calculating FPS per second
 
     def on_user_registered(self):
         """Callback when registration is successful."""
