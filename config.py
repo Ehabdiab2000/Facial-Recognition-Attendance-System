@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-
+import cv2
 logger = logging.getLogger(__name__)
 
 # --- General ---
@@ -91,6 +91,9 @@ RED_LED_PIN = _loaded_config["RED_LED_PIN"]
 
 # --- UI ---
 APP_TITLE = _loaded_config["APP_TITLE"]
+FONT = cv2.FONT_HERSHEY_DUPLEX
+FONT_SCALE = 0.7
+FONT_THICKNESS = 2
 
 # --- Function to update a setting in memory and save to file ---
 def update_setting(key, value):

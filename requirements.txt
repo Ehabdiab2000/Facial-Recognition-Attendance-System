@@ -4,5 +4,4 @@ face_recognition
 requests
 numpy
 dlib
-scipy
-# RPi.GPIO # Optional, only needed on Pi
+RPi.GPIO # Optional, only needed on Pi

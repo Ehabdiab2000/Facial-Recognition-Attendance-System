@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timedelta
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                            QHBoxLayout, QLabel, QPushButton, QSizePolicy, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QMessageBox)
+                            QHBoxLayout, QLabel, QPushButton, QSizePolicy, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QMessageBox, QDialog)
 from PyQt6.QtGui import QPixmap, QImage, QFont, QColor, QPainter
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QMutex, QMutexLocker , pyqtSlot
 
@@ -21,6 +21,70 @@ from camera_thread import CameraThread
 from registration_dialog import RegistrationDialog
 # Import the new settings dialog
 from settings_dialog import SettingsDialog
+
+class AutoCloseDialog(QDialog):
+    def __init__(self, message, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Welcome")
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setModal(False)
+        
+        # Set a fixed size for more professional appearance
+        self.setFixedSize(400, 200)
+        
+        # Create a more professional looking layout
+        layout = QVBoxLayout()
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Add a welcome header
+        header = QLabel("WELCOME")
+        header_font = QFont()
+        header_font.setPointSize(18)
+        header_font.setBold(True)
+        header.setFont(header_font)
+        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header.setStyleSheet("color: #2c3e50;")
+        layout.addWidget(header)
+        
+        # Add the user's name with larger font
+        self.label = QLabel(message)
+        name_font = QFont()
+        name_font.setPointSize(24)
+        name_font.setBold(True)
+        self.label.setFont(name_font)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setStyleSheet("color: #27ae60; margin: 10px;")
+        layout.addWidget(self.label)
+        
+        # Add timestamp
+        time_label = QLabel(datetime.now().strftime("%H:%M:%S"))
+        time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        time_label.setStyleSheet("color: #7f8c8d; font-size: 14px;")
+        layout.addWidget(time_label)
+        
+        # Set dialog styling
+        self.setStyleSheet("""
+            QDialog {
+                background-color: white;
+                border: 2px solid #3498db;
+                border-radius: 10px;
+            }
+        """)
+        
+        self.setLayout(layout)
+        self.show()
+        
+        # Move to center-top position
+        screen_geometry = QApplication.primaryScreen().geometry()
+        self.move(
+            int((screen_geometry.width() - self.width()) / 2),
+            50
+        )
+        
+        # Add a self-closing timer
+        self.close_timer = QTimer(self)
+        self.close_timer.timeout.connect(self.close)
+        self.close_timer.setSingleShot(True)
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, # Change to DEBUG for more detail
@@ -125,8 +189,21 @@ class MainWindow(QMainWindow):
 
         # --- Periodic UI Update Timer (for FPS display, etc.) ---
         self.ui_update_timer = QTimer(self)
-        self.ui_update_timer.timeout.connect(self.update_ui_elements)
-        self.ui_update_timer.start(1000) # Update FPS once per second
+        # Initialize FPS calculation variables
+        self.frame_count_since_last_update = 0
+        self.last_fps_update_time = time.time()
+        
+        def update_fps():
+            now = time.time()
+            elapsed = now - self.last_fps_update_time
+            if elapsed > 0:
+                fps = self.frame_count_since_last_update / elapsed
+                self.fps_label.setText(f"FPS: {fps:.1f}")
+                self.frame_count_since_last_update = 0
+                self.last_fps_update_time = now
+            
+        self.ui_update_timer.timeout.connect(update_fps)
+        self.ui_update_timer.start(1000)
 
     def open_registration_dialog(self):
         """Pauses processing and opens the registration dialog."""
@@ -200,31 +277,57 @@ class MainWindow(QMainWindow):
         logger.info(f"Camera thread for index {index} started.")
 
     def show_temporary_message(self, title, text, duration_ms=3000):
-        """Displays a non-blocking message box that closes automatically."""
-        if self.welcome_message_box and self.welcome_message_box.isVisible():
-            self.welcome_message_box.close() # Close previous one if still open
+        """Displays a professional-looking non-blocking welcome dialog that closes automatically."""
+        # Ensure any existing message box and its timer are properly handled
+        # Cleanup any existing message components
+        if hasattr(self, 'welcome_dialog'):
+            if self.welcome_dialog:
+                if hasattr(self.welcome_dialog, 'close_timer') and self.welcome_dialog.close_timer.isActive():
+                    self.welcome_dialog.close_timer.stop()
+                self.welcome_dialog.close()
+                self.welcome_dialog.deleteLater()
+            self.welcome_dialog = None
 
-        self.welcome_message_box = QMessageBox(self)
-        self.welcome_message_box.setIcon(QMessageBox.Icon.Information)
-        self.welcome_message_box.setWindowTitle(title)
-        self.welcome_message_box.setText(text)
-        self.welcome_message_box.setStandardButtons(QMessageBox.StandardButton.NoButton) # No buttons
-        self.welcome_message_box.setModal(False) # Non-blocking
-        # Position it somewhere reasonable, e.g., top center
+        # Create new welcome dialog with enhanced styling
+        self.welcome_dialog = AutoCloseDialog(text, self)
+        self.welcome_dialog.setWindowTitle(title)
+        
+        # Position the dialog at the center-top of the screen
         screen_geometry = QApplication.primaryScreen().geometry()
-        msg_box_size = self.welcome_message_box.sizeHint()
-        self.welcome_message_box.move(int((screen_geometry.width() - msg_box_size.width()) / 2), 50)
-        self.welcome_message_box.show()
-        QTimer.singleShot(duration_ms, self.welcome_message_box.close) # Auto-close
+        dialog_size = self.welcome_dialog.size()
+        self.welcome_dialog.move(
+            int((screen_geometry.width() - dialog_size.width()) / 2), 
+            50
+        )
+        
+        # Start the dialog's self-closing timer
+        self.welcome_dialog.close_timer.start(duration_ms)
+        
+        logger.info(f"Showing professional welcome message for user: '{text}' for {duration_ms}ms")
+        
+        # No need for separate timer as the dialog has its own timer now
+
+    def close_welcome_message(self):
+        """Safely closes the welcome dialog."""
+        if hasattr(self, 'welcome_dialog') and self.welcome_dialog:
+            logger.info("Closing welcome dialog.")
+            if hasattr(self.welcome_dialog, 'close_timer') and self.welcome_dialog.close_timer.isActive():
+                self.welcome_dialog.close_timer.stop()
+            self.welcome_dialog.close()
+            self.welcome_dialog = None # Clear reference
+        else:
+            logger.debug("close_welcome_message called but welcome dialog was already None.")
 
     def open_settings_dialog(self):
         """Opens the system settings dialog."""
-        # Pause processing while settings are open?
-        # self.processing_active = False # Consider implications
+        # Pause processing while settings are open
+        self.processing_active = False
+        self.stop_all_cameras()
         dialog = SettingsDialog(self) # Pass parent
         dialog.exec() # Show modally
         # Reload config or notify components if needed after save
-        # self.processing_active = True
+        self.processing_active = True
+        self.start_camera(config.PRIMARY_CAMERA_INDEX, config.FPS_LIMIT)
         logger.info("Settings dialog closed.")
         # Potentially re-apply some settings immediately if needed
         # e.g., self.face_processor.load_known_faces() if threshold changed?
@@ -254,11 +357,16 @@ class MainWindow(QMainWindow):
             # Check if recognition is paused
             if self.recognition_paused_until and now < self.recognition_paused_until:
                 # Still paused, update display but don't process
-                self.update_video_display(frame, self.last_known_face_locations, self.last_recognized_data, paused=True)
+                # Clear previous results to avoid showing stale boxes during pause
+                self.update_video_display(frame, [], [], paused=True)
                 return # Skip processing
-            else:
-                # Pause finished or wasn't active
+            elif self.recognition_paused_until and now >= self.recognition_paused_until:
+                # Pause finished
                 self.recognition_paused_until = None
+                # Clear last results as we resume normal processing
+                self.last_known_face_locations = []
+                self.last_recognized_data = []
+                logger.info("Recognition pause finished.")
 
             # Throttle processing based on FPS limit
             if self.processing_active and (now - self.last_frame_time >= 1.0 / config.FPS_LIMIT):
@@ -335,11 +443,15 @@ class MainWindow(QMainWindow):
                     # 3. Show temporary welcome message
                     self.show_temporary_message("Welcome!", f"Hello, {name}!", duration_ms=3000)
                     # 4. Pause recognition process
-                    self.recognition_paused_until = time.time() + 4.0 # Pause for 4 seconds
-                    logger.info("Recognition paused for 4 seconds.")
-                    # Update display immediately to show pause state if needed
+                    pause_duration = 4.0 # seconds
+                    self.recognition_paused_until = time.time() + pause_duration
+                    logger.info(f"Recognition paused for {pause_duration} seconds.")
+                    # Clear current recognition results immediately to prevent stale display during pause
+                    self.last_known_face_locations = []
+                    self.last_recognized_data = []
+                    # Update display immediately to show pause state
                     if self.current_primary_frame is not None:
-                         self.update_video_display(self.current_primary_frame, face_locations, recognized_data, paused=True)
+                         self.update_video_display(self.current_primary_frame, [], [], paused=True)
                     break # Process only the first recognized person fully for welcome message/pause
 
                 else:
@@ -361,6 +473,9 @@ class MainWindow(QMainWindow):
             status_text = "Status: Monitoring... No faces detected."
             status_color = "white"
             hw.set_led_status(False) # Ensure default state (Red ON) if no faces
+            # Clear last results if no faces are detected to remove lingering boxes
+            self.last_known_face_locations = []
+            self.last_recognized_data = []
 
         self.update_status_label(status_text, status_color)
 
@@ -379,75 +494,31 @@ class MainWindow(QMainWindow):
             display_frame = frame.copy()
             h, w, _ = display_frame.shape
 
-            # Draw rectangles and names
-            for i, (top, right, bottom, left) in enumerate(face_locations):
-                color = (0, 0, 255) # Red for unknown by default
-                name = config.UNKNOWN_PERSON_LABEL
-                if i < len(recognized_data):
-                    rec_data = recognized_data[i]
-                    name = rec_data.get('name', config.UNKNOWN_PERSON_LABEL)
-                    user_id = rec_data.get('id')
-                    if user_id is not None:
-                        # Check if within cooldown for display purposes
-                        last_seen = self.last_recognition_details.get(user_id)
-                        if last_seen and (datetime.now() - last_seen) < timedelta(seconds=config.RECOGNITION_COOLDOWN_SEC):
-                             color = (0, 255, 255) # Yellow for recognized but cooldown
-                        else:
-                             color = (0, 255, 0) # Green for recognized
-                    elif name != config.UNKNOWN_PERSON_LABEL: # Should have ID, but fallback
-                         color = (0, 255, 0)
+            # If paused, we don't need to show any text - just display the clean frame
+            if not paused:
+                # Draw boxes for recognized faces without text labels
+                for i, ((top, right, bottom, left), data) in enumerate(zip(face_locations, recognized_data)):
+                    name = data.get('name', config.UNKNOWN_PERSON_LABEL)
+                    box_color = (0, 0, 255) # Red for unknown by default
+                    if name != config.UNKNOWN_PERSON_LABEL:
+                        box_color = (0, 255, 0) # Green for known
 
-                # Draw rectangle
-                cv2.rectangle(display_frame, (left, top), (right, bottom), color, 2)
-
-                # Draw label
-                label = f"{name}"
-                if name != config.UNKNOWN_PERSON_LABEL and i < len(recognized_data):
-                     distance = recognized_data[i].get('distance', 1.0)
-                     label += f" ({distance:.2f})"
-
-                # Text background
-                (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-                cv2.rectangle(display_frame, (left, bottom - text_height - baseline - 5), (left + text_width, bottom), color, cv2.FILLED)
-                # Text itself
-                cv2.putText(display_frame, label, (left + 3, bottom - baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
-
-            # Add "Paused" overlay if needed
-            if paused:
-                overlay_color = (0, 0, 0, 180) # Semi-transparent black
-                text_color = (255, 255, 255, 255) # White
-                font_scale = 1.5
-                thickness = 2
-                text = "Recognition Paused"
-                (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-                text_x = int((w - text_w) / 2)
-                text_y = int((h + text_h) / 2)
-                # Create overlay rectangle (using numpy for potential alpha blending if needed)
-                sub_img = display_frame[text_y - text_h - 10:text_y + 10, text_x - 10:text_x + text_w + 10]
-                white_rect = np.ones(sub_img.shape, dtype=np.uint8) * 0 # Black background
-                alpha = 0.7 # Transparency factor
-                res = cv2.addWeighted(sub_img, alpha, white_rect, 1-alpha, 1.0)
-                display_frame[text_y - text_h - 10:text_y + 10, text_x - 10:text_x + text_w + 10] = res
-                # Put text on overlay
-                cv2.putText(display_frame, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color[:3], thickness, cv2.LINE_AA)
-
+                    # Draw a box around the face - but no text
+                    cv2.rectangle(display_frame, (left, top), (right, bottom), box_color, 2)
+                    
+                    # No text labels on the video feed - we use the popup dialog instead
+                    # This makes the interface look more professional
 
             # Convert frame to QPixmap
             rgb_image = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb_image.shape
-            bytes_per_line = ch * w
-            qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            qt_image = QImage(rgb_image.data, w, h, w * 3, QImage.Format.Format_RGB888)
             pixmap = QPixmap.fromImage(qt_image)
-            self.video_label.setPixmap(pixmap.scaled(self.video_label.size(),
-                                                    Qt.AspectRatioMode.KeepAspectRatio,
-                                                    Qt.TransformationMode.SmoothTransformation))
+            self.video_label.setPixmap(pixmap)
+
         except Exception as e:
             logger.error(f"Error updating video display: {e}", exc_info=True)
-            # Optionally display error on label itself
-            # painter = QPainter(self.video_label.pixmap())
-            # painter.setPen(QColor("red"))
-            # painter.drawText(10, 30, f"Display Error: {e}")
-            # painter.end()
+            # Optionally display an error message on the label itself
+            # self.video_label.setText(f"Display Error: {e}")
 
     @pyqtSlot(str, str) # Decorator ensures it runs in the main thread
     def update_status_label(self, text, color="white"):
@@ -456,11 +527,18 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet(f"color: {color};")
 
     def update_ui_elements(self):
-        """Periodically updates UI elements like FPS."""
-        # Calculate FPS (simple average over the last second)
-        # More sophisticated FPS calculation might be needed
-        # This is just a placeholder
-        self.fps_label.setText(f"FPS: {self.frame_counter}") # Assuming frame_counter resets or is handled elsewhere
+        """Updates UI elements like FPS label."""
+        # Calculate FPS based on actual processed frames per second
+        now = time.time()
+        elapsed = now - getattr(self, '_last_fps_update', now)
+        if not hasattr(self, '_fps_counter'):
+            self._fps_counter = 0
+        self._fps_counter += 1
+        if elapsed >= 1.0:
+            fps = self._fps_counter / elapsed
+            self.fps_label.setText(f"FPS: {fps:.1f}")
+            self._fps_counter = 0
+            self._last_fps_update = now
         # Reset frame counter for the next second? Depends on how FPS is calculated.
         # self.frame_counter = 0 # If calculating FPS per second
 
@@ -489,30 +567,22 @@ class MainWindow(QMainWindow):
 
 
     def closeEvent(self, event):
-        """Handles application closing."""
-        logger.info("Close event triggered. Shutting down...")
+        """Ensure all threads and timers are stopped and the application exits cleanly."""
+        logger.info("MainWindow closeEvent triggered. Cleaning up threads and timers.")
         self.processing_active = False
-
-        # 1. Stop worker thread
-        if self.worker_thread.isRunning():
-            logger.info("Stopping worker thread...")
-            # self.worker.stop() # No longer needed
-            self.worker_thread.quit() # Ask the thread's event loop to exit
-            if not self.worker_thread.wait(3000): # Wait 3 sec
-                 logger.warning("Worker thread did not quit gracefully.")
-
-
-        # 2. Stop camera threads
         self.stop_all_cameras()
-
-        # 3. Stop network manager thread
-        self.network_manager.stop()
-
-        # 4. Cleanup hardware
-        hw.cleanup()
-
-        logger.info("Shutdown complete.")
-        event.accept() # Proceed with closing
+        if hasattr(self, 'ui_update_timer') and self.ui_update_timer.isActive():
+            self.ui_update_timer.stop()
+        if hasattr(self, 'worker_thread') and self.worker_thread.isRunning():
+            self.worker_thread.quit()
+            self.worker_thread.wait()
+        if hasattr(self, 'network_manager') and hasattr(self.network_manager, 'stop'):
+            self.network_manager.stop()
+        if hasattr(self, 'welcome_dialog') and self.welcome_dialog:
+            self.welcome_dialog.close()
+        logger.info("Cleanup complete. Exiting application.")
+        QApplication.quit()
+        event.accept()
 
 
 # --- Main Execution ---
