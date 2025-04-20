@@ -55,7 +55,9 @@ class CameraThread(QThread):
 
                 # Emit the raw frame
                 if frame is not None:
-                    self.frame_ready.emit(frame.copy(), self.camera_index) # Emit a copy
+                    # Rotate frame -90 degrees for RPi camera orientation - REMOVED
+                    # rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    self.frame_ready.emit(frame.copy(), self.camera_index) # Emit a copy of the original frame
 
                 # Limit FPS
                 elapsed_time = time.time() - start_time

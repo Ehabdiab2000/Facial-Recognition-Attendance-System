@@ -103,6 +103,25 @@ class DatabaseManager:
         finally:
             conn.close()
 
+    def get_user_by_id(self, user_id):
+        """Fetches a single user by their ID."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT id, name, details, encoding FROM users WHERE id = ?", (user_id,))
+            user = cursor.fetchone()
+            if user:
+                logger.debug(f"User found for ID {user_id}: {user['name']}")
+                return user # Return sqlite3.Row object
+            else:
+                logger.warning(f"No user found with ID: {user_id}")
+                return None
+        except sqlite3.Error as e:
+            logger.error(f"Failed to fetch user with ID {user_id}: {e}")
+            return None
+        finally:
+            conn.close()
+
     def add_transaction(self, user_id):
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -160,6 +179,56 @@ class DatabaseManager:
                 return False
         except sqlite3.Error as e:
             logger.error(f"Failed to update status for transaction {transaction_id}: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    def update_user_details(self, user_id, name, details):
+        """Updates the name and details of an existing user."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("UPDATE users SET name = ?, details = ? WHERE id = ?",
+                           (name, details, user_id))
+            conn.commit()
+            if cursor.rowcount > 0:
+                logger.info(f"User ID {user_id} details updated successfully.")
+                return True
+            else:
+                logger.warning(f"User ID {user_id} not found for update.")
+                return False
+        except sqlite3.Error as e:
+            logger.error(f"Failed to update details for user ID {user_id}: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    def delete_user(self, user_id):
+        """Deletes a user and their associated transactions."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            # Optional: Delete associated transactions first (or set ON DELETE CASCADE)
+            cursor.execute("DELETE FROM transactions WHERE user_id = ?", (user_id,))
+            logger.info(f"Deleted transactions for user ID {user_id}.")
+
+            # Delete the user
+            cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            conn.commit()
+
+            if cursor.rowcount > 0:
+                logger.info(f"User ID {user_id} deleted successfully.")
+                return True
+            else:
+                logger.warning(f"User ID {user_id} not found for deletion.")
+                # Rollback if user wasn't found but transactions might have been deleted?
+                # Or commit anyway if deleting non-existent user's transactions is ok.
+                # Let's commit as transactions might not exist anyway.
+                return False
+        except sqlite3.Error as e:
+            logger.error(f"Failed to delete user ID {user_id}: {e}")
             conn.rollback()
             return False
         finally:

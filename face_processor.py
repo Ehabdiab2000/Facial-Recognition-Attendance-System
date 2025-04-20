@@ -1,7 +1,7 @@
 # face_processor.py
 import face_recognition
 import numpy as np
-import cv2
+import cv2 # Make sure cv2 is imported
 import config
 import logging
 
@@ -101,8 +101,30 @@ class FaceProcessor:
 
     def process_frame(self, frame_rgb, frame_count):
         """Combined processing: detect and recognize."""
-        # Get locations and encodings
-        face_locations, face_encodings = self.detect_and_encode(frame_rgb)
+        # --- START ADDED RESIZE CODE ---
+        original_h, original_w = frame_rgb.shape[:2]
+        target_width = 320 # Consider making this configurable via config.py
+        processed_frame_rgb = frame_rgb # Default to original
+        scale_x = 1.0
+        scale_y = 1.0
+
+        if original_w > target_width:
+            aspect_ratio = original_h / original_w
+            target_height = int(target_width * aspect_ratio)
+            logger.debug(f"Resizing frame from {original_w}x{original_h} to {target_width}x{target_height} for detection.")
+            try:
+                processed_frame_rgb = cv2.resize(frame_rgb, (target_width, target_height), interpolation=cv2.INTER_AREA)
+                scale_x = original_w / target_width
+                scale_y = original_h / target_height
+            except Exception as e:
+                logger.error(f"Error resizing frame: {e}. Using original frame.")
+                processed_frame_rgb = frame_rgb # Fallback to original
+                scale_x = 1.0
+                scale_y = 1.0
+        # --- END ADDED RESIZE CODE ---
+
+        # Get locations and encodings using the potentially resized frame
+        face_locations, face_encodings = self.detect_and_encode(processed_frame_rgb) # Use processed_frame_rgb
 
         recognized_data = []
         if face_encodings:
@@ -112,5 +134,25 @@ class FaceProcessor:
         else:
             logger.debug("No faces detected.")
 
-        # Return only locations and recognized data
-        return face_locations, recognized_data
+        # --- START ADDED SCALING CODE ---
+        # Adjust face locations back to original frame coordinates if resized
+        original_face_locations = []
+        if scale_x != 1.0 or scale_y != 1.0:
+             logger.debug("Scaling detected face locations back to original frame size.")
+             for (top, right, bottom, left) in face_locations:
+                 original_top = int(top * scale_y)
+                 original_right = int(right * scale_x)
+                 original_bottom = int(bottom * scale_y)
+                 original_left = int(left * scale_x)
+                 # Clamp coordinates to original frame dimensions to avoid errors
+                 original_top = max(0, original_top)
+                 original_left = max(0, original_left)
+                 original_bottom = min(original_h, original_bottom)
+                 original_right = min(original_w, original_right)
+                 original_face_locations.append((original_top, original_right, original_bottom, original_left))
+        else:
+             original_face_locations = face_locations # No scaling needed
+        # --- END ADDED SCALING CODE ---
+
+        # Return adjusted locations and recognized data
+        return original_face_locations, recognized_data # Return scaled locations
