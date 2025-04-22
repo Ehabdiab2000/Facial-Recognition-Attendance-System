@@ -42,6 +42,29 @@ def activate_relay():
     else:
         logger.info(f"[MOCK] Activate relay for {config.DOOR_OPEN_DURATION_SEC} seconds.")
 
+def trigger_relay(duration_seconds: float):
+    """Activates the relay for a specific duration.
+
+    Args:
+        duration_seconds: The time in seconds to keep the relay active.
+    """
+    if IS_PI and GPIO:
+        try:
+            logger.info(f"Triggering relay (Pin {config.RELAY_PIN}) for {duration_seconds:.2f} seconds.")
+            GPIO.output(config.RELAY_PIN, GPIO.HIGH)
+            time.sleep(duration_seconds)
+            GPIO.output(config.RELAY_PIN, GPIO.LOW)
+            logger.info(f"Deactivating relay (Pin {config.RELAY_PIN}) after trigger.")
+        except Exception as e:
+            logger.error(f"Error triggering relay: {e}")
+            # Ensure relay is off in case of error during sleep
+            try:
+                GPIO.output(config.RELAY_PIN, GPIO.LOW)
+            except Exception as cleanup_e:
+                logger.error(f"Error ensuring relay is off after trigger error: {cleanup_e}")
+    else:
+        logger.info(f"[MOCK] Trigger relay for {duration_seconds:.2f} seconds.")
+
 def set_led_status(identified: bool):
     """Sets the LED status: Green for identified, Red for not identified/default."""
     if IS_PI and GPIO:

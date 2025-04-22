@@ -28,7 +28,7 @@ class UserManagementDialog(QDialog):
         self.face_processor = face_processor
         self.setWindowTitle("User Management")
         self.setModal(True)
-        self.setMinimumSize(800, 600)
+        self.setMinimumSize(500, 800)
 
         # State variables for potential editing/adding
         self.current_frame = None
@@ -148,38 +148,21 @@ class UserManagementDialog(QDialog):
             return
 
         logger.info(f"Opening Edit User dialog for user ID: {user_id}")
-        # Create a dedicated Edit Dialog or adapt RegistrationDialog
-        # This requires fetching user data and pre-filling fields
-        # For simplicity, let's just allow editing name/details for now
+        # Reuse RegistrationDialog for editing
+        from registration_dialog import RegistrationDialog
+        edit_dialog = RegistrationDialog(self.db_manager, self.face_processor, self, edit_user_id=user_id)
+        
+        # Pre-fill existing user data
         user_data = self.db_manager.get_user_by_id(user_id)
         if not user_data:
             QMessageBox.warning(self, "Error", f"Could not find user with ID {user_id}.")
             return
-
+            
         _, name, details, _ = user_data
-
-        edit_dialog = QDialog(self)
-        edit_dialog.setWindowTitle(f"Edit User: {name}")
-        edit_layout = QVBoxLayout(edit_dialog)
-
-        name_label = QLabel("Name:")
-        name_input = QLineEdit(name)
-        details_label = QLabel("Details:")
-        details_input = QLineEdit(details if details else "")
-
-        # Optional: Add camera preview and re-capture button here if needed
-
-        edit_layout.addWidget(name_label)
-        edit_layout.addWidget(name_input)
-        edit_layout.addWidget(details_label)
-        edit_layout.addWidget(details_input)
-
-        # Standard buttons
-        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        button_box.accepted.connect(lambda: self._save_user_edits(user_id, name_input.text(), details_input.text(), edit_dialog))
-        button_box.rejected.connect(edit_dialog.reject)
-        edit_layout.addWidget(button_box)
-
+        edit_dialog.name_input.setText(name)
+        edit_dialog.details_input.setText(details if details else "")
+        
+        edit_dialog.user_registered.connect(self._handle_user_change)
         edit_dialog.exec()
 
     def _save_user_edits(self, user_id, new_name, new_details, dialog):

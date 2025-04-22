@@ -19,17 +19,18 @@ logger = logging.getLogger(__name__)
 class RegistrationDialog(QDialog):
     user_registered = pyqtSignal() # Signal emitted when user is successfully registered
 
-    def __init__(self, db_manager, face_processor: FaceProcessor, parent=None):
+    def __init__(self, db_manager, face_processor: FaceProcessor, parent=None, edit_user_id=None):
         super().__init__(parent)
         self.db_manager = db_manager
         self.face_processor = face_processor
-        self.setWindowTitle("Register New User")
+        self.setWindowTitle("Register New User" if edit_user_id is None else "Edit User")
         self.setModal(True) # Block main window interaction
 
         # State variables
         self.current_frame = None
         self.captured_encoding = None
         self.face_location = None # Store location of the face used for encoding
+        self.edit_user_id = edit_user_id # Track if we're editing an existing user
 
         # UI Elements
         self._setup_ui()
@@ -56,7 +57,7 @@ class RegistrationDialog(QDialog):
         self.reg_camera_thread = None
         self._start_registration_camera()
 
-        self.setMinimumSize(800, 600) # Adjust size as needed
+        self.setMinimumSize(500, 800) # Adjust size as needed
 
     def _setup_ui(self):
         self.main_layout = QVBoxLayout(self)
@@ -259,25 +260,40 @@ class RegistrationDialog(QDialog):
             QMessageBox.warning(self, "Input Error", "Name cannot be empty.")
             return
 
-        if self.captured_encoding is None:
+        if self.captured_encoding is None and self.edit_user_id is None:
             QMessageBox.warning(self, "Input Error", "No face encoding has been captured.")
             return
 
         # Confirmation dialog (optional but recommended)
+        action = "update" if self.edit_user_id else "register"
         reply = QMessageBox.question(self, 'Confirm Save',
-                                       f"Save user '{name}' with the captured face?",
+                                       f"{action.capitalize()} user '{name}' with the captured face?",
                                        QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel,
                                        QMessageBox.StandardButton.Cancel)
 
         if reply == QMessageBox.StandardButton.Save:
-            user_id = self.db_manager.add_user(name, details, self.captured_encoding)
-            if user_id:
-                QMessageBox.information(self, "Success", f"User '{name}' registered successfully!")
-                self.face_processor.load_known_faces() # Reload known faces in the main app
-                self.user_registered.emit() # Notify main window
-                self.accept() # Close the dialog successfully
+            if self.edit_user_id:
+                # Update existing user
+                success = self.db_manager.update_user_details(self.edit_user_id, name, details)
+                if self.captured_encoding is not None:
+                    success = success and self.db_manager.update_user_encoding(self.edit_user_id, self.captured_encoding)
+                if success:
+                    QMessageBox.information(self, "Success", f"User '{name}' updated successfully!")
+                    self.face_processor.load_known_faces()
+                    self.user_registered.emit()
+                    self.accept()
+                else:
+                    QMessageBox.critical(self, "Database Error", f"Failed to update user '{name}'.")
             else:
-                QMessageBox.critical(self, "Database Error", f"Failed to save user '{name}' to the database.")
+                # Add new user
+                user_id = self.db_manager.add_user(name, details, self.captured_encoding)
+                if user_id:
+                    QMessageBox.information(self, "Success", f"User '{name}' registered successfully!")
+                    self.face_processor.load_known_faces()
+                    self.user_registered.emit()
+                    self.accept()
+                else:
+                    QMessageBox.critical(self, "Database Error", f"Failed to save user '{name}' to the database.")
         else:
              logger.info("User save cancelled by user.")
 

@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt
 # Import the update_setting function and necessary config values
 import config
 from config import update_setting
+from on_screen_keyboard import OnScreenKeyboard
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,11 @@ class SettingsDialog(QDialog):
 
     def _setup_ui(self):
         self.main_layout = QVBoxLayout(self)
+        
+        # Add On-Screen Keyboard
+        self.keyboard = OnScreenKeyboard()
+        self.main_layout.addWidget(self.keyboard)
+        
         form_layout = QFormLayout()
 
         # --- Recognition Settings ---
@@ -38,6 +44,12 @@ class SettingsDialog(QDialog):
         self.cooldown_spinbox.setRange(0, 60)
         self.cooldown_spinbox.setSuffix(" seconds")
         recognition_layout.addRow("Recognition Cooldown:", self.cooldown_spinbox)
+        
+        # Add server URL input
+        self.server_url_input = QLineEdit()
+        self.server_url_input.setPlaceholderText("Enter server URL")
+        recognition_layout.addRow("Server URL:", self.server_url_input)
+        
         recognition_group.setLayout(recognition_layout)
         form_layout.addRow(recognition_group)
 
@@ -47,8 +59,22 @@ class SettingsDialog(QDialog):
         self.primary_cam_spinbox = QSpinBox()
         self.primary_cam_spinbox.setRange(0, 10)
         camera_layout.addRow("Primary Camera Index:", self.primary_cam_spinbox)
-
-        # Add more settings as needed (e.g., FPS, resolution)
+        
+        # Add FPS setting
+        self.fps_spinbox = QSpinBox()
+        self.fps_spinbox.setRange(1, 60)
+        self.fps_spinbox.setSuffix(" FPS")
+        camera_layout.addRow("FPS Limit:", self.fps_spinbox)
+        
+        # Add resolution settings
+        self.frame_width_spinbox = QSpinBox()
+        self.frame_width_spinbox.setRange(320, 1920)
+        camera_layout.addRow("Frame Width:", self.frame_width_spinbox)
+        
+        self.frame_height_spinbox = QSpinBox()
+        self.frame_height_spinbox.setRange(240, 1080)
+        camera_layout.addRow("Frame Height:", self.frame_height_spinbox)
+        
         camera_group.setLayout(camera_layout)
         form_layout.addRow(camera_group)
 
@@ -99,6 +125,11 @@ class SettingsDialog(QDialog):
             self.threshold_spinbox.setValue(config.RECOGNITION_THRESHOLD)
             self.cooldown_spinbox.setValue(config.RECOGNITION_COOLDOWN_SEC)
             self.primary_cam_spinbox.setValue(config.PRIMARY_CAMERA_INDEX)
+            self.server_url_input.setText(config.SERVER_URL)
+            self.fps_spinbox.setValue(config.FPS_LIMIT)
+            self.frame_width_spinbox.setValue(config.FRAME_WIDTH)
+            self.frame_height_spinbox.setValue(config.FRAME_HEIGHT)
+            
             # Load hardware settings
             self.use_gpio_checkbox.setChecked(config.USE_GPIO)
             self.relay_pin_spinbox.setValue(config.RELAY_PIN)
@@ -109,6 +140,10 @@ class SettingsDialog(QDialog):
             # Enable/disable hardware fields based on checkbox
             self._toggle_gpio_fields(config.USE_GPIO)
             self.use_gpio_checkbox.stateChanged.connect(self._toggle_gpio_fields)
+            
+            # Connect keyboard to input fields
+            self.server_url_input.installEventFilter(self)
+            self.keyboard.set_target_lineEdit(self.server_url_input)
 
         except AttributeError as e:
             logger.error(f"Error loading setting: {e}. Check config.py and settings.json.")
@@ -136,6 +171,10 @@ class SettingsDialog(QDialog):
             "RECOGNITION_THRESHOLD": self.threshold_spinbox.value(),
             "RECOGNITION_COOLDOWN_SEC": self.cooldown_spinbox.value(),
             "PRIMARY_CAMERA_INDEX": self.primary_cam_spinbox.value(),
+            "SERVER_URL": self.server_url_input.text(),
+            "FPS_LIMIT": self.fps_spinbox.value(),
+            "FRAME_WIDTH": self.frame_width_spinbox.value(),
+            "FRAME_HEIGHT": self.frame_height_spinbox.value(),
             "USE_GPIO": self.use_gpio_checkbox.isChecked(),
             "RELAY_PIN": self.relay_pin_spinbox.value(),
             "DOOR_OPEN_DURATION_SEC": self.door_duration_spinbox.value(),

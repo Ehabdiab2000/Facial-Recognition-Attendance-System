@@ -5,3 +5,4 @@ requests
 numpy
 dlib
 RPi.GPIO # Optional, only needed on Pi
+pygame

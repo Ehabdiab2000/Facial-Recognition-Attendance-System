@@ -204,6 +204,27 @@ class DatabaseManager:
             return False
         finally:
             conn.close()
+            
+    def update_user_encoding(self, user_id, encoding):
+        """Updates the face encoding of an existing user."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("UPDATE users SET encoding = ? WHERE id = ?",
+                           (encoding, user_id))
+            conn.commit()
+            if cursor.rowcount > 0:
+                logger.info(f"User ID {user_id} face encoding updated successfully.")
+                return True
+            else:
+                logger.warning(f"User ID {user_id} not found for encoding update.")
+                return False
+        except sqlite3.Error as e:
+            logger.error(f"Failed to update encoding for user ID {user_id}: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
 
     def delete_user(self, user_id):
         """Deletes a user and their associated transactions."""
