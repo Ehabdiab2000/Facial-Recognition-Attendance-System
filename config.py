@@ -88,6 +88,9 @@ RELAY_PIN = _loaded_config["RELAY_PIN"]
 DOOR_OPEN_DURATION_SEC = _loaded_config["DOOR_OPEN_DURATION_SEC"]
 GREEN_LED_PIN = _loaded_config["GREEN_LED_PIN"]
 RED_LED_PIN = _loaded_config["RED_LED_PIN"]
+# --- Wiegand Reader Pins ---
+WIEGAND_DATA0_PIN = _loaded_config.get("WIEGAND_DATA0_PIN", 5)
+WIEGAND_DATA1_PIN = _loaded_config.get("WIEGAND_DATA1_PIN", 6)
 
 # --- UI ---
 APP_TITLE = _loaded_config["APP_TITLE"]

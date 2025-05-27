@@ -1,0 +1,798 @@
+Okay, this is a significant feature addition. We'll need to modify several parts of your project to incorporate Wiegand card reader support for ID card verification as an alternative or complement to facial recognition.
+
+**High-Level Plan:**
+
+1.  **Hardware Connection (Wiegand Reader to Raspberry Pi):**
+    *   Wiegand readers typically have D0 (Data 0) and D1 (Data 1) lines, plus VCC and GND.
+    *   These D0/D1 lines will be connected to two GPIO pins on the Raspberry Pi.
+2.  **Wiegand Protocol Decoding Software:**
+    *   We need a Python script/library to listen on these GPIO pins, detect the bit pulses from the Wiegand reader, and decode them into a card number.
+3.  **Database Modification:**
+    *   Add a `card_number` field to the `users` table.
+4.  **User Registration UI Modification:**
+    *   Add a field in `registration_dialog.py` to input/scan the card number.
+    *   Potentially allow scanning the card directly during registration.
+5.  **Main Application Logic Modification:**
+    *   Listen for card scan events.
+    *   When a card is scanned, look up the user by card number in the database.
+    *   Integrate this with the facial recognition flow (e.g., either method grants access).
+    *   Handle the pause/welcome message for card-based identification too.
+
+**Let's break down the code changes:**
+
+---
+
+**Step 1: Wiegand Reader Script (`wiegand_reader.py`)**
+
+This is the most crucial new piece for hardware interaction. We'll create a script that runs in a separate thread to monitor GPIO pins.
+
+*   **Install `RPi.GPIO` (if not already thoroughly tested on Pi):**
+    ```bash
+    pip install RPi.GPIO
+    ```
+
+*   **Create `wiegand_reader.py`:**
+
+    ```python
+    # wiegand_reader.py
+    import time
+    import logging
+    from threading import Thread, Event
+    from PyQt6.QtCore import QObject, pyqtSignal # To signal card scans to main thread
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        import RPi.GPIO as GPIO
+        IS_PI = True
+    except ImportError:
+        logger.warning("RPi.GPIO not found. Wiegand reader will be mocked.")
+        IS_PI = False
+        GPIO = None # Mock GPIO
+
+    # --- Wiegand Reader Configuration ---
+    # These are EXAMPLE pins, change them to the actual GPIO pins you connect D0 and D1 to
+    # Use BCM numbering
+    PIN_D0 = 14 # Example: GPIO14
+    PIN_D1 = 15 # Example: GPIO15
+    WIEGAND_TIMEOUT_MS = 100 # Milliseconds to wait for the next bit
+
+    class WiegandReader(QObject): # Inherit QObject for signals
+        card_scanned = pyqtSignal(str) # Emits the decoded card number
+
+        def __init__(self, pin_d0=PIN_D0, pin_d1=PIN_D1, parent=None):
+            super().__init__(parent)
+            self.pin_d0 = pin_d0
+            self.pin_d1 = pin_d1
+            self._bits = []
+            self._last_bit_time = 0
+            self._running = False
+            self._thread = None
+            self._stop_event = Event()
+
+            if IS_PI and GPIO:
+                GPIO.setmode(GPIO.BCM)
+                GPIO.setup(self.pin_d0, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                GPIO.setup(self.pin_d1, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                logger.info(f"Wiegand reader GPIO pins D0:{self.pin_d0}, D1:{self.pin_d1} initialized.")
+            elif not IS_PI:
+                logger.info("Wiegand reader running in mock mode.")
+
+
+        def _bit_received_d0(self, channel):
+            if self._running:
+                self._bits.append(0)
+                self._last_bit_time = time.time() * 1000 # milliseconds
+
+        def _bit_received_d1(self, channel):
+            if self._running:
+                self._bits.append(1)
+                self._last_bit_time = time.time() * 1000 # milliseconds
+
+        def _process_bits(self):
+            card_number_str = ""
+            num_bits = len(self._bits)
+
+            if num_bits == 0:
+                return
+
+            logger.debug(f"Processing {num_bits} Wiegand bits: {self._bits}")
+
+            # Common Wiegand formats are 26-bit, 34-bit, 37-bit, etc.
+            # Basic 26-bit format:
+            # Parity Bit | Facility Code (8 bits) | Card Number (16 bits) | Parity Bit
+            if num_bits == 26:
+                # Example: Extract card number portion (bits 9-24, or 1 to 16 after facility code)
+                # For simplicity, we'll just take the middle 16 bits as card number here
+                # A more robust implementation would check parity bits and potentially facility code.
+                facility_code = int("".join(map(str, self._bits[1:9])), 2)
+                card_code = int("".join(map(str, self._bits[9:25])), 2) # 16 bits
+                card_number_str = str(card_code)
+                logger.info(f"Decoded 26-bit Wiegand: Facility={facility_code}, Card={card_code}")
+            # Add other format decodings if needed (e.g., 34-bit)
+            elif num_bits == 34: # Example for 34-bit
+                # Often the full 32 bits between parity bits are considered the card number
+                card_code = int("".join(map(str, self._bits[1:33])), 2)
+                card_number_str = str(card_code)
+                logger.info(f"Decoded 34-bit Wiegand: Card={card_code}")
+            else:
+                # For unknown formats, just join all bits as a raw binary string or hex
+                card_number_str = "RAW_BINARY:" + "".join(map(str, self._bits))
+                logger.warning(f"Unsupported Wiegand bit length: {num_bits}. Raw: {card_number_str}")
+
+
+            if card_number_str and not card_number_str.startswith("RAW_BINARY:"):
+                logger.info(f"Card scanned: {card_number_str}")
+                self.card_scanned.emit(card_number_str) # Emit the signal
+            elif card_number_str.startswith("RAW_BINARY:"):
+                # Optionally emit raw data too if you want to handle it
+                # self.card_scanned.emit(card_number_str)
+                pass
+
+            self._bits = [] # Reset for next scan
+
+        def _reader_loop(self):
+            if IS_PI and GPIO:
+                GPIO.add_event_detect(self.pin_d0, GPIO.FALLING, callback=self._bit_received_d0, bouncetime=5) # bouncetime in ms
+                GPIO.add_event_detect(self.pin_d1, GPIO.FALLING, callback=self._bit_received_d1, bouncetime=5)
+
+            self._last_bit_time = time.time() * 1000
+
+            while not self._stop_event.is_set():
+                current_time = time.time() * 1000
+                if len(self._bits) > 0 and (current_time - self._last_bit_time > WIEGAND_TIMEOUT_MS):
+                    self._process_bits()
+                time.sleep(0.01) # Sleep briefly to reduce CPU usage
+
+            logger.info("Wiegand reader loop stopped.")
+            if IS_PI and GPIO:
+                GPIO.remove_event_detect(self.pin_d0)
+                GPIO.remove_event_detect(self.pin_d1)
+
+
+        def start(self):
+            if self._running:
+                logger.warning("Wiegand reader already running.")
+                return
+
+            self._running = True
+            self._stop_event.clear()
+            self._thread = Thread(target=self._reader_loop, daemon=True)
+            self._thread.start()
+            logger.info("Wiegand reader thread started.")
+
+        def stop(self):
+            if not self._running:
+                logger.info("Wiegand reader not running.")
+                return
+
+            logger.info("Stopping Wiegand reader thread...")
+            self._running = False # Signal to callbacks to stop appending bits
+            self._stop_event.set() # Signal thread to exit loop
+            if self.pin_d0 is not None and IS_PI: # Trigger dummy events to break out of potential GPIO waits
+                pass # This part is tricky with GPIO event detection directly
+            if self._thread:
+                self._thread.join(timeout=1.0) # Wait for thread to finish
+                if self._thread.is_alive():
+                    logger.warning("Wiegand reader thread did not stop cleanly.")
+            self._thread = None
+            logger.info("Wiegand reader stopped.")
+
+        # Mock function for testing on non-Pi
+        def mock_scan(self, card_number):
+            if not IS_PI:
+                logger.info(f"[MOCK] Wiegand card scanned: {card_number}")
+                self.card_scanned.emit(str(card_number))
+            else:
+                logger.warning("Mock scan called on Pi. Use actual reader.")
+
+    # --- Cleanup GPIO on exit ---
+    def cleanup_gpio():
+        if IS_PI and GPIO:
+            logger.info("Cleaning up Wiegand GPIO.")
+            GPIO.cleanup([PIN_D0, PIN_D1]) # Clean up specific pins
+
+    if __name__ == '__main__':
+        # Example usage and test
+        logging.basicConfig(level=logging.DEBUG)
+        reader = WiegandReader()
+
+        def print_card(card_num):
+            print(f"MAIN THREAD RECEIVED CARD: {card_num}")
+
+        reader.card_scanned.connect(print_card)
+        reader.start()
+
+        print("Wiegand reader started. Scan a card or use mock_scan() if not on Pi.")
+        try:
+            if not IS_PI:
+                time.sleep(2)
+                reader.mock_scan("12345678")
+                time.sleep(2)
+                reader.mock_scan("87654321")
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("Stopping reader...")
+        finally:
+            reader.stop()
+            if IS_PI:
+                cleanup_gpio()
+            print("Reader finished.")
+    ```
+    *   **Important:** Change `PIN_D0` and `PIN_D1` to the actual BCM GPIO numbers you use.
+    *   This script uses GPIO event detection. It collects bits and processes them when a timeout occurs (no new bits for `WIEGAND_TIMEOUT_MS`).
+    *   The decoding logic is basic for 26-bit and 34-bit. Real-world Wiegand formats can be more complex (parity checks, different bit lengths for facility/card codes). You might need to adjust this based on your cards.
+    *   It emits a `card_scanned` signal (PyQt style) with the string representation of the card number.
+
+---
+
+**Step 2: Modify `database_manager.py`**
+
+*   Add `card_number TEXT UNIQUE` to the `users` table. `UNIQUE` ensures no two users have the same card.
+*   Update `add_user` to include `card_number`.
+*   Add `get_user_by_card_number`.
+*   Update `update_user_details` if you want to allow card number changes (or create a separate method).
+
+```python
+# database_manager.py
+# ... (imports) ...
+
+class DatabaseManager:
+    def __init__(self, db_path=config.DATABASE_PATH): # Assuming config.DATABASE_PATH is correct
+        self.db_path = db_path
+        self._create_tables()
+
+    def _get_connection(self):
+        conn = sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _create_tables(self):
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    details TEXT,
+                    encoding ARRAY NOT NULL,
+                    card_number TEXT UNIQUE,  -- New field
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            # ... (transactions table remains the same) ...
+            conn.commit()
+            logger.info("Database tables (with card_number) checked/created successfully.")
+        except sqlite3.Error as e:
+            logger.error(f"Database table creation error: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def add_user(self, name, details, encoding, card_number=None): # Added card_number
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        # Ensure card_number is None if empty string, to allow NULL in DB for UNIQUE constraint
+        card_number_to_db = card_number if card_number else None
+        try:
+            cursor.execute("INSERT INTO users (name, details, encoding, card_number) VALUES (?, ?, ?, ?)",
+                           (name, details, encoding, card_number_to_db))
+            conn.commit()
+            user_id = cursor.lastrowid
+            logger.info(f"User '{name}' (Card: {card_number_to_db}) added successfully with ID: {user_id}.")
+            return user_id
+        except sqlite3.IntegrityError as e: # Catch UNIQUE constraint violation for card_number
+            logger.error(f"Failed to add user '{name}': {e}. Card number '{card_number_to_db}' might already exist.")
+            conn.rollback()
+            return None
+        except sqlite3.Error as e:
+            logger.error(f"Failed to add user '{name}': {e}")
+            conn.rollback()
+            return None
+        finally:
+            conn.close()
+
+    def get_all_users(self): # Fetch card_number too
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT id, name, details, encoding, card_number FROM users") # Added card_number
+            users = cursor.fetchall()
+            return users
+        except sqlite3.Error as e:
+            logger.error(f"Failed to fetch users: {e}")
+            return []
+        finally:
+            conn.close()
+
+    def get_user_by_id(self, user_id): # Useful for UserManagementDialog
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT id, name, details, encoding, card_number FROM users WHERE id = ?", (user_id,))
+            user = cursor.fetchone()
+            return user # Returns a sqlite3.Row object or None
+        except sqlite3.Error as e:
+            logger.error(f"Failed to fetch user by ID {user_id}: {e}")
+            return None
+        finally:
+            conn.close()
+
+
+    def get_user_by_card_number(self, card_number): # New method
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT id, name, details, encoding FROM users WHERE card_number = ?", (card_number,))
+            user = cursor.fetchone() # Returns a sqlite3.Row object or None
+            return user
+        except sqlite3.Error as e:
+            logger.error(f"Failed to fetch user by card number {card_number}: {e}")
+            return None
+        finally:
+            conn.close()
+
+    def update_user_details(self, user_id, name, details, card_number=None): # Added card_number
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        card_number_to_db = card_number if card_number else None
+        try:
+            cursor.execute("UPDATE users SET name = ?, details = ?, card_number = ? WHERE id = ?",
+                           (name, details, card_number_to_db, user_id))
+            conn.commit()
+            if cursor.rowcount > 0:
+                logger.info(f"User ID {user_id} details (name, details, card) updated.")
+                return True
+            logger.warning(f"User ID {user_id} not found for detail update.")
+            return False
+        except sqlite3.IntegrityError as e:
+            logger.error(f"Failed to update user {user_id}: Card number '{card_number_to_db}' may already be in use by another user. {e}")
+            conn.rollback()
+            return False
+        except sqlite3.Error as e:
+            logger.error(f"Failed to update user details for ID {user_id}: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    def update_user_encoding(self, user_id, encoding): # Remains mostly the same
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("UPDATE users SET encoding = ? WHERE id = ?", (encoding, user_id))
+            conn.commit()
+            if cursor.rowcount > 0:
+                logger.info(f"User ID {user_id} face encoding updated.")
+                return True
+            logger.warning(f"User ID {user_id} not found for encoding update.")
+            return False
+        except sqlite3.Error as e:
+            logger.error(f"Failed to update encoding for user ID {user_id}: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    # ... (add_transaction, get_pending_transactions, update_transaction_status remain the same) ...
+```
+
+---
+
+**Step 3: Modify `registration_dialog.py` (or `user_management_dialog.py` if you've refactored to that)**
+
+*   Add a `QLineEdit` for the card number.
+*   Potentially a "Scan Card" button that waits for a card scan from the Wiegand reader.
+
+```python
+# registration_dialog.py (or user_management_dialog.py)
+# ... (imports) ...
+
+class RegistrationDialog(QDialog): # Or UserManagementDialog
+    # ... (user_registered signal) ...
+
+    def __init__(self, db_manager, face_processor: FaceProcessor, parent=None, edit_user_id=None, wiegand_reader_instance=None): # Added wiegand_reader
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self.face_processor = face_processor
+        self.wiegand_reader_instance = wiegand_reader_instance # Store Wiegand reader instance
+        # ... (set window title, modal, state vars) ...
+        self.edit_user_id = edit_user_id
+        self.original_card_number = None # To check if card number changed during edit
+
+        self._setup_ui() # Call before loading data if editing
+
+        if self.edit_user_id:
+            self.load_user_data_for_editing()
+
+        # ... (keyboard setup, camera setup) ...
+        # If Wiegand reader is passed, connect its signal to populate the card field
+        if self.wiegand_reader_instance:
+            self.wiegand_reader_instance.card_scanned.connect(self.on_card_scanned_in_dialog)
+
+
+    def _setup_ui(self):
+        self.main_layout = QVBoxLayout(self)
+        # ... (preview_label) ...
+
+        form_layout = QHBoxLayout()
+        input_layout = QVBoxLayout()
+
+        self.name_label = QLabel("Name:")
+        self.name_input = QLineEdit()
+        input_layout.addWidget(self.name_label)
+        input_layout.addWidget(self.name_input)
+
+        self.details_label = QLabel("Details (Optional):")
+        self.details_input = QLineEdit()
+        input_layout.addWidget(self.details_label)
+        input_layout.addWidget(self.details_input)
+
+        # --- Add Card Number Field ---
+        self.card_label = QLabel("Card Number:")
+        self.card_input = QLineEdit()
+        self.card_input.setPlaceholderText("Enter or scan card number")
+        # Optional: Make it read-only if you only want scanning
+        # self.card_input.setReadOnly(True)
+        input_layout.addWidget(self.card_label)
+        input_layout.addWidget(self.card_input)
+        # -----------------------------
+
+        form_layout.addLayout(input_layout)
+        # ... (action_layout for capture button, status_label) ...
+        self.main_layout.addLayout(form_layout)
+        # ... (save/cancel buttons, keyboard) ...
+        # Ensure the save button logic handles both new and edit scenarios
+        self.save_button.setText("Save User" if self.edit_user_id is None else "Update User")
+        # Enable save button if editing existing user, or if face captured for new
+        if self.edit_user_id:
+            self.save_button.setEnabled(True)
+        else:
+            self.save_button.setEnabled(False) # Only enable after face capture for new user
+
+    def load_user_data_for_editing(self):
+        if self.edit_user_id is None:
+            return
+        user_data = self.db_manager.get_user_by_id(self.edit_user_id) # Assumes this method exists
+        if user_data:
+            self.name_input.setText(user_data['name'])
+            self.details_input.setText(user_data['details'] or "")
+            self.card_input.setText(user_data['card_number'] or "")
+            self.original_card_number = user_data['card_number'] # Store for checking changes
+            # Note: Face encoding is not pre-loaded; user must re-capture if they want to change it.
+            self.status_label.setText("Editing user. Capture new face to update.")
+        else:
+            QMessageBox.critical(self, "Error", f"Could not load data for user ID {self.edit_user_id}.")
+            self.reject() # Close if user not found
+
+
+    @pyqtSlot(str) # Slot to receive card number
+    def on_card_scanned_in_dialog(self, card_number):
+        # This slot is active only when the dialog is open
+        if self.isVisible(): # Check if dialog is currently visible
+            logger.info(f"Card scanned in registration dialog: {card_number}")
+            self.card_input.setText(card_number)
+            QMessageBox.information(self, "Card Scanned", f"Card Number: {card_number} captured.")
+
+
+    def capture_face_encoding(self):
+        # ... (existing capture logic) ...
+        # If capturing a face for a new user, save button is enabled
+        if self.captured_encoding is not None and self.edit_user_id is None:
+            self.save_button.setEnabled(True)
+        elif self.edit_user_id is not None: # If editing, save is already enabled, capture is optional
+             self.save_button.setEnabled(True) # Ensure it stays enabled
+
+
+    def save_user(self):
+        name = self.name_input.text().strip()
+        details = self.details_input.text().strip()
+        card_number = self.card_input.text().strip() # Get card number
+
+        if not name:
+            QMessageBox.warning(self, "Input Error", "Name cannot be empty.")
+            return
+
+        # Card number validation (basic: not empty if provided, or allow empty)
+        # if card_number and not card_number.isdigit(): # Example simple validation
+        #     QMessageBox.warning(self, "Input Error", "Card number must be digits only if provided.")
+        #     return
+
+        # If new user, face encoding is mandatory
+        if self.edit_user_id is None and self.captured_encoding is None:
+            QMessageBox.warning(self, "Input Error", "No face encoding has been captured for new user.")
+            return
+
+        action = "update" if self.edit_user_id else "register"
+        confirm_msg = f"{action.capitalize()} user '{name}'?"
+        if self.captured_encoding:
+            confirm_msg += " (Face will be updated/set)"
+        if card_number:
+            confirm_msg += f" (Card: {card_number})"
+
+        reply = QMessageBox.question(self, 'Confirm Save', confirm_msg,
+                                       QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel)
+
+        if reply == QMessageBox.StandardButton.Save:
+            success = False
+            if self.edit_user_id:
+                # Update existing user
+                success = self.db_manager.update_user_details(self.edit_user_id, name, details, card_number)
+                if self.captured_encoding is not None: # Only update encoding if a new one was captured
+                    encoding_success = self.db_manager.update_user_encoding(self.edit_user_id, self.captured_encoding)
+                    success = success and encoding_success
+                if success:
+                    QMessageBox.information(self, "Success", f"User '{name}' updated successfully!")
+                else:
+                    QMessageBox.critical(self, "Database Error", f"Failed to update user '{name}'. Card number might be in use.")
+            else: # Add new user
+                user_id = self.db_manager.add_user(name, details, self.captured_encoding, card_number)
+                if user_id:
+                    success = True
+                    QMessageBox.information(self, "Success", f"User '{name}' registered successfully!")
+                else:
+                    QMessageBox.critical(self, "Database Error", f"Failed to save user '{name}'. Card number might be in use.")
+
+            if success:
+                self.face_processor.load_known_faces() # Reload known faces for main app
+                self.user_registered.emit() # Signal that a user was added/updated
+                self.accept() # Close dialog
+
+    def closeEvent(self, event):
+        # Disconnect Wiegand reader signal if connected
+        if self.wiegand_reader_instance:
+            try:
+                self.wiegand_reader_instance.card_scanned.disconnect(self.on_card_scanned_in_dialog)
+            except TypeError: # Raised if not connected
+                pass
+        # ... (rest of closeEvent for camera) ...
+        super().closeEvent(event)
+
+    def reject(self):
+        if self.wiegand_reader_instance:
+            try:
+                self.wiegand_reader_instance.card_scanned.disconnect(self.on_card_scanned_in_dialog)
+            except TypeError:
+                pass
+        # ... (rest of reject for camera) ...
+        super().reject()
+```
+*   Note: `user_management_dialog.py` will need similar changes if it's the one handling adding/editing. The key is adding the `card_number` field and handling its save/load.
+
+---
+
+**Step 4: Modify `main.py`**
+
+*   Initialize and start the `WiegandReader`.
+*   Connect its `card_scanned` signal to a handler method.
+*   In the handler, look up the user by card, and if found, trigger the same actions as facial recognition (welcome message, relay, transaction log).
+*   Ensure the Wiegand reader is stopped on application close.
+
+```python
+# main.py
+# ... (other imports) ...
+from wiegand_reader import WiegandReader, cleanup_gpio as cleanup_wiegand_gpio # Import WiegandReader and cleanup
+# Ensure user_management_dialog is imported for UserManagementDialog
+from user_management_dialog import UserManagementDialog # Assuming you have this from previous steps
+# Remove settings_dialog from main.py as it was specific to the settings feature
+# from settings_dialog import SettingsDialog
+
+# ... (RecognitionStatusDialog, Worker class, etc. from your provided file) ...
+
+class MainWindow(QMainWindow):
+    # ... (request_processing signal) ...
+    def __init__(self):
+        super().__init__()
+        # ... (setWindowTitle, setWindowFlags, showFullScreen) ...
+
+        # --- Initialize Core Components ---
+        self.db_manager = DatabaseManager()
+        self.face_processor = FaceProcessor(self.db_manager)
+        self.network_manager = NetworkManager(self.db_manager)
+
+        # --- Initialize Wiegand Reader ---
+        self.wiegand_reader = WiegandReader()
+        self.wiegand_reader.card_scanned.connect(self.handle_card_scan)
+        self.wiegand_reader.start() # Start listening for card scans
+        # ---------------------------------
+
+        # ... (state variables: last_known_face_locations, last_recognized_data, etc.) ...
+        # ... (recognition_paused_until, current_status_dialog, etc.) ...
+
+        self._setup_ui() # Load UI from .ui file
+
+        # ... (Worker thread setup) ...
+        # ... (Camera threads setup) ...
+        # ... (Periodic UI update timer for FPS) ...
+        # ... (Pygame mixer init) ...
+
+    def _setup_ui(self):
+        # ... (Your existing _setup_ui method that loads mainwindow.ui) ...
+        # Ensure all button connections from your UI file are made here.
+        # Example:
+        # self.usermanagement.clicked.connect(self.open_user_management_dialog)
+        # self.setting.clicked.connect(self.open_settings_dialog_placeholder) # Placeholder if settings dialog is separate
+        # self.adduser_2.clicked.connect(self.close) # Exit button
+        pass # Replace with your actual UI loading and connections
+
+    def open_user_management_dialog(self):
+        logger.info("Opening User Management dialog.")
+        self.processing_active = False
+        self.stop_all_cameras()
+
+        # Pass the Wiegand reader instance to the dialog
+        dialog = UserManagementDialog(self.db_manager, self.face_processor, self, wiegand_reader_instance=self.wiegand_reader)
+        dialog.users_changed.connect(self.handle_users_changed)
+        dialog.exec()
+
+        self.processing_active = True
+        QTimer.singleShot(500, lambda: self.start_camera(config.PRIMARY_CAMERA_INDEX, config.FPS_LIMIT))
+
+
+    # Placeholder if you have a settings button from the UI file
+    # def open_settings_dialog_placeholder(self):
+    #     logger.info("Settings button clicked (placeholder for main.py).")
+    #     # If you implement the SettingsDialog from earlier example:
+    #     # from settings_dialog import SettingsDialog
+    #     # from settings_manager import SettingsManager # Assuming you use this
+    #     # settings_mgr_instance = SettingsManager()
+    #     # dialog = SettingsDialog(settings_mgr_instance, self)
+    #     # dialog.exec()
+    #     QMessageBox.information(self, "Settings", "Settings dialog not fully implemented here yet.")
+
+
+    @pyqtSlot(str) # Slot for card scan signal
+    def handle_card_scan(self, card_number_str):
+        logger.info(f"Card scanned event received in MainWindow: {card_number_str}")
+
+        # --- Check if a status dialog is already visible OR if processing is paused by face recognition ---
+        if (self.current_status_dialog and self.current_status_dialog.isVisible()) or \
+           (self.recognition_paused_until and time.time() < self.recognition_paused_until):
+            logger.debug("Card scan received while status dialog is visible or face recognition is paused. Ignoring.")
+            return
+
+        user = self.db_manager.get_user_by_card_number(card_number_str)
+        now_ts = time.time() # For cooldown
+        now_dt = datetime.now() # For last_recognition_details
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        media_dir = os.path.join(script_dir, 'media')
+
+        if user:
+            user_id = user['id']
+            name = user['name']
+            last_rec_time_for_user = self.last_recognition_details.get(user_id, datetime.min) # Use datetime.min
+
+            # Check cooldown for this user (card or face)
+            if (now_dt - last_rec_time_for_user).total_seconds() > config.RECOGNITION_COOLDOWN_SEC:
+                logger.info(f"Card access granted for: {name} (ID: {user_id}), Card: {card_number_str}")
+                self.last_recognition_details[user_id] = now_dt # Update last recognition time
+
+                transaction_id = self.db_manager.add_transaction(user_id)
+                if transaction_id:
+                    self.network_manager.queue_transaction(transaction_id)
+                hw.activate_relay() # Activate relay
+
+                message = f"Welcome, {name}! (Card Access)"
+                status = 'accepted'
+                icon_path = os.path.join(media_dir, "accept.png")
+                bg_color = "rgba(173, 216, 230, 200)"
+                sound_path = os.path.join(media_dir, "access accepted.wav")
+
+                if self.current_status_dialog: self.current_status_dialog.close()
+                self.current_status_dialog = RecognitionStatusDialog(message, status, icon_path, bg_color, sound_path, self)
+                self.current_status_dialog.show()
+
+                self.pause_processing(config.RECOGNITION_COOLDOWN_SEC) # Pause overall processing
+            else:
+                logger.debug(f"User {name} (Card: {card_number_str}) identified again within cooldown. Skipping actions.")
+                # Optionally show a "Welcome back" type of brief message without full pause
+                self.update_status_label(f"Welcome back, {name}!", "green")
+
+
+        else: # Unknown card
+            logger.info(f"Unknown card scanned: {card_number_str}")
+            self.update_status_label("Access Denied: Unknown Card", "red")
+
+            message = "Access Rejected: Card not registered."
+            status = 'rejected'
+            icon_path = os.path.join(media_dir, "rejected.png")
+            bg_color = "rgba(255, 192, 203, 200)"
+            sound_path = os.path.join(media_dir, "access rejected.wav")
+
+            if self.current_status_dialog: self.current_status_dialog.close()
+            self.current_status_dialog = RecognitionStatusDialog(message, status, icon_path, bg_color, sound_path, self)
+            self.current_status_dialog.show()
+
+            self.pause_processing(config.RECOGNITION_COOLDOWN_SEC) # Pause after unknown card
+
+
+    # handle_recognition_result:
+    # Ensure that if self.current_status_dialog is active, face results are ignored
+    # Also, when a face is recognized and triggers a dialog, the card scan should be ignored
+    # The pause_processing method will handle the general pause.
+    @pyqtSlot(list, list)
+    def handle_recognition_result(self, face_locations, recognized_data):
+        if (self.current_status_dialog and self.current_status_dialog.isVisible()) or \
+           (self.recognition_paused_until and time.time() < self.recognition_paused_until):
+            logger.debug("Face recognition result received while status dialog is visible or processing is paused. Ignoring.")
+            # Still update last known locations for display if not fully paused
+            if not (self.recognition_paused_until and time.time() < self.recognition_paused_until):
+                 self.last_known_face_locations = face_locations
+                 self.last_recognized_data = recognized_data
+            return
+
+        # ... (rest of your existing handle_recognition_result logic) ...
+        # The key change is already in the if block above.
+        # The `pause_processing` call within `handle_recognition_result` for known/unknown faces
+        # will prevent card scans from interfering during that brief pause.
+
+
+    def closeEvent(self, event):
+        # ... (existing cleanup for cameras, network, worker) ...
+        logger.info("Stopping Wiegand reader...")
+        if hasattr(self, 'wiegand_reader'):
+            self.wiegand_reader.stop()
+        if IS_PI: # IS_PI should be defined in wiegand_reader.py
+            cleanup_wiegand_gpio() # Call the cleanup function from wiegand_reader
+        logger.info("Wiegand reader stopped and GPIO cleaned up (if applicable).")
+        # ... (pygame.mixer.quit(), super().closeEvent(event)) ...
+        super().closeEvent(event) # Call super class's closeEvent
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    # Ensure IS_PI is correctly determined for Wiegand GPIO cleanup path
+    # This typically happens when wiegand_reader module is imported.
+    # from wiegand_reader import IS_PI # Not strictly needed here if cleanup is conditional in its own module
+
+    app = QApplication(sys.argv)
+    main_window = MainWindow()
+    main_window.show()
+    exit_code = app.exec()
+
+    # Explicitly call Wiegand cleanup if not handled by an atexit or signal in wiegand_reader.py
+    # This is a fallback if closeEvent isn't always guaranteed or if IS_PI logic isn't perfect
+    # However, putting it in closeEvent is generally better.
+    # if IS_PI: # Check again
+    #     from wiegand_reader import cleanup_gpio as wg_cleanup
+    #     wg_cleanup()
+
+    logger.info(f"Application exiting with code {exit_code}")
+    sys.exit(exit_code)
+
+```
+
+---
+
+**Step 5: Test Rigorously**
+
+*   **Hardware First (on Pi):**
+    *   Connect your Wiegand reader's D0, D1, VCC, GND to the Pi correctly. Double-check pin numbers.
+    *   Run `python wiegand_reader.py` standalone. Scan a card. Does it print the card number correctly? Debug the GPIO connections and Wiegand decoding logic if not.
+*   **Database:** Delete your `attendance.db` file to let it be recreated with the new `card_number` column.
+*   **Registration:**
+    *   Can you register a new user with a card number (manually typed or scanned if you implement scan-to-field)?
+    *   Does it prevent duplicate card numbers?
+*   **Identification:**
+    *   Does scanning a registered card grant access (message, relay)?
+    *   Does facial recognition still work?
+    *   Does the cooldown apply to both methods for the same user?
+    *   Does the `RecognitionStatusDialog` show correctly for both face and card access/rejection?
+    *   Does the `pause_processing` mechanism work correctly to prevent immediate re-triggering by either method?
+*   **Mock Mode (on Laptop):**
+    *   In `wiegand_reader.py`, `IS_PI` will be `False`.
+    *   You'll need a way to trigger `wiegand_reader.mock_scan("some_card_number")` from your `MainWindow` for testing the logic, perhaps via a hidden button or a timer for dev purposes.
+
+**Important Considerations:**
+
+*   **Wiegand Bit Length/Format:** The `_process_bits` in `wiegand_reader.py` is a basic example. You *must* know the exact bit format of your cards (e.g., 26-bit H10301 format has specific facility code bits and card number bits, plus parity bits). You might need to adjust the slicing and conversion.
+*   **GPIO BCM vs. Board Numbering:** Ensure you're using BCM numbering consistently for GPIO pins.
+*   **Debouncing/Noise:** The `bouncetime` in `GPIO.add_event_detect` helps, but noisy environments might require more robust debouncing.
+*   **Error Handling:** Add more robust error handling around GPIO operations and Wiegand decoding.
+*   **Security of Card Numbers:** If card numbers are sensitive, consider how they are stored and displayed.
+*   **Combined Logic:** Decide if a user needs *both* face and card, or if *either* is sufficient. The current implementation makes them independent alternatives. If "both" are needed, the state machine becomes more complex.
+
+This is a substantial update. Take it step-by-step, testing each component.

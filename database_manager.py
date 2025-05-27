@@ -50,6 +50,7 @@ class DatabaseManager:
                     name TEXT NOT NULL,
                     details TEXT,
                     encoding ARRAY NOT NULL, -- Custom type using converter
+                    card_number TEXT UNIQUE,  -- New field for Wiegand card ID
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -60,9 +61,20 @@ class DatabaseManager:
                     user_id INTEGER NOT NULL,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     status TEXT DEFAULT 'pending', -- pending, sent, failed
+                    method TEXT, -- New field for transaction method (face, card, manual)
                     FOREIGN KEY (user_id) REFERENCES users (id)
                 )
             """)
+            # Add 'method' column to transactions table if it doesn't exist (for schema migration)
+            try:
+                cursor.execute("ALTER TABLE transactions ADD COLUMN method TEXT")
+                logger.info("Added 'method' column to transactions table.")
+            except sqlite3.OperationalError as e:
+                if 'duplicate column name' in str(e):
+                    pass # Column already exists, ignore
+                else:
+                    raise # Re-raise other operational errors
+
             conn.commit()
             logger.info("Database tables checked/created successfully.")
         except sqlite3.Error as e:
@@ -71,16 +83,22 @@ class DatabaseManager:
         finally:
             conn.close()
 
-    def add_user(self, name, details, encoding):
+    def add_user(self, name, details, encoding, card_number=None): # Added card_number
         conn = self._get_connection()
         cursor = conn.cursor()
+        # Ensure card_number is None if empty string or whitespace, to allow NULL in DB for UNIQUE constraint
+        card_number_to_db = card_number if card_number and card_number.strip() else None
         try:
-            cursor.execute("INSERT INTO users (name, details, encoding) VALUES (?, ?, ?)",
-                           (name, details, encoding))
+            cursor.execute("INSERT INTO users (name, details, encoding, card_number) VALUES (?, ?, ?, ?)",
+                           (name, details, encoding, card_number_to_db))
             conn.commit()
             user_id = cursor.lastrowid
-            logger.info(f"User '{name}' added successfully with ID: {user_id}.")
+            logger.info(f"User '{name}' (Card: {card_number_to_db}) added successfully with ID: {user_id}.")
             return user_id
+        except sqlite3.IntegrityError as e: # Catch UNIQUE constraint violation for card_number
+            logger.error(f"Failed to add user '{name}': {e}. Card number '{card_number_to_db}' might already exist.")
+            conn.rollback()
+            return None
         except sqlite3.Error as e:
             logger.error(f"Failed to add user '{name}': {e}")
             conn.rollback()
@@ -88,46 +106,38 @@ class DatabaseManager:
         finally:
             conn.close()
 
-    def get_all_users(self):
+    def get_all_users(self): # Fetch card_number too
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute("SELECT id, name, details, encoding FROM users")
+            cursor.execute("SELECT id, name, details, encoding, card_number FROM users") # Added card_number
             users = cursor.fetchall()
-            # Convert Row objects to simple dictionaries if needed, though Row is often fine
-            # return [dict(user) for user in users]
-            return users # Return list of sqlite3.Row objects
+            return users
         except sqlite3.Error as e:
             logger.error(f"Failed to fetch users: {e}")
             return []
         finally:
             conn.close()
 
-    def get_user_by_id(self, user_id):
-        """Fetches a single user by their ID."""
+    def get_user_by_id(self, user_id): # Useful for UserManagementDialog
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute("SELECT id, name, details, encoding FROM users WHERE id = ?", (user_id,))
-            user = cursor.fetchone()
-            if user:
-                logger.debug(f"User found for ID {user_id}: {user['name']}")
-                return user # Return sqlite3.Row object
-            else:
-                logger.warning(f"No user found with ID: {user_id}")
-                return None
+            cursor.execute("SELECT id, name, details, encoding, card_number FROM users WHERE id = ?", (user_id,))
+            user = cursor.fetchone() # Returns a sqlite3.Row object or None
+            return user
         except sqlite3.Error as e:
-            logger.error(f"Failed to fetch user with ID {user_id}: {e}")
+            logger.error(f"Failed to fetch user by ID {user_id}: {e}")
             return None
         finally:
             conn.close()
 
-    def add_transaction(self, user_id):
+    def add_transaction(self, user_id, method="unknown"):
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute("INSERT INTO transactions (user_id, status) VALUES (?, ?)",
-                           (user_id, 'pending'))
+            cursor.execute("INSERT INTO transactions (user_id, status, method) VALUES (?, ?, ?)",
+                           (user_id, 'pending', method))
             conn.commit()
             transaction_id = cursor.lastrowid
             logger.info(f"Transaction logged for user ID {user_id}. Transaction ID: {transaction_id}")
@@ -184,24 +194,41 @@ class DatabaseManager:
         finally:
             conn.close()
 
-    def update_user_details(self, user_id, name, details):
-        """Updates the name and details of an existing user."""
+    def update_user_details(self, user_id, name, details, card_number=None): # Added card_number
+        """Updates the name, details, and card_number of an existing user."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        card_number_to_db = card_number if card_number and card_number.strip() else None
+        try:
+            cursor.execute("UPDATE users SET name = ?, details = ?, card_number = ? WHERE id = ?",
+                           (name, details, card_number_to_db, user_id))
+            conn.commit()
+            if cursor.rowcount > 0:
+                logger.info(f"User ID {user_id} details (name, details, card) updated.")
+                return True
+            logger.warning(f"User ID {user_id} not found for detail update.")
+            return False
+        except sqlite3.IntegrityError as e:
+            logger.error(f"Failed to update user {user_id}: Card number '{card_number_to_db}' may already be in use by another user. {e}")
+            conn.rollback()
+            return False
+        except sqlite3.Error as e:
+            logger.error(f"Failed to update user details for ID {user_id}: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    def get_user_by_card_number(self, card_number): # New method
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute("UPDATE users SET name = ?, details = ? WHERE id = ?",
-                           (name, details, user_id))
-            conn.commit()
-            if cursor.rowcount > 0:
-                logger.info(f"User ID {user_id} details updated successfully.")
-                return True
-            else:
-                logger.warning(f"User ID {user_id} not found for update.")
-                return False
+            cursor.execute("SELECT id, name, details, encoding, card_number FROM users WHERE card_number = ?", (card_number,))
+            user = cursor.fetchone() # Returns a sqlite3.Row object or None
+            return user
         except sqlite3.Error as e:
-            logger.error(f"Failed to update details for user ID {user_id}: {e}")
-            conn.rollback()
-            return False
+            logger.error(f"Failed to fetch user by card number {card_number}: {e}")
+            return None
         finally:
             conn.close()
             

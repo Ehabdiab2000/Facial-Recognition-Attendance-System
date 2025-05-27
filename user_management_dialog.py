@@ -85,7 +85,7 @@ class UserManagementDialog(QDialog):
 
             self.user_table.setRowCount(len(users))
             for row, user in enumerate(users):
-                user_id, name, details, _ = user # Encoding not needed here
+                user_id, name, details, _, _ = user # Encoding and card_number not needed here
 
                 # Create items
                 id_item = QTableWidgetItem(str(user_id))

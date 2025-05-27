@@ -10,6 +10,7 @@ import os
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QSizePolicy, QMessageBox, QDialog, QStatusBar) # Added QStatusBar
 from PyQt6.QtGui import QPixmap, QImage, QFont, QColor, QPainter, QIcon # Added QIcon
+from wiegand_reader import WiegandReader # Added for Wiegand support
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QMutex, QMutexLocker, pyqtSlot, QUrl # Added QUrl
 # from PyQt6.QtMultimedia import QSoundEffect # Removed QSoundEffect
 import pygame # Added pygame
@@ -268,6 +269,31 @@ class MainWindow(QMainWindow):
         self.face_processor = FaceProcessor(self.db_manager)
         self.network_manager = NetworkManager(self.db_manager) # Starts its own thread
 
+        # Initialize Wiegand Reader
+        self.wiegand_reader = WiegandReader(pin_d0=config.WIEGAND_DATA0_PIN, pin_d1=config.WIEGAND_DATA1_PIN)
+        self.wiegand_reader.card_scanned.connect(self.handle_card_scan)
+        self.wiegand_reader.start()
+        logger.info("Wiegand reader initialized and started.")
+        
+        # After self.network_manager = NetworkManager(...)
+        # New Periodic User Synchronization logic
+        if getattr(config, 'NETWORK_ENABLED', False) and self.network_manager and hasattr(self.network_manager, 'sync_users_from_backend'):
+            self.user_sync_timer = QTimer(self)
+            self.user_sync_timer.timeout.connect(self.perform_user_sync)
+            sync_interval_minutes = getattr(config, 'USER_SYNC_INTERVAL_MINUTES', 30)
+            sync_interval_ms = sync_interval_minutes * 60 * 1000
+            if sync_interval_ms > 0:
+                self.user_sync_timer.start(sync_interval_ms)
+                logger.info(f"Periodic user synchronization scheduled every {sync_interval_minutes} minutes.")
+                # Perform an initial sync shortly after startup
+                QTimer.singleShot(5000, self.perform_user_sync) 
+            else:
+                logger.info("Periodic user synchronization disabled (interval <= 0 minutes).")
+        elif getattr(config, 'NETWORK_ENABLED', False):
+            logger.warning("Network features enabled, but NetworkManager may not be fully initialized or 'sync_users_from_backend' method is missing. Periodic sync disabled.")
+        else:
+            logger.info("Network features are disabled. User synchronization will not occur.")
+
         # --- State Variables ---
         self.last_known_face_locations = []
         self.last_recognized_data = []
@@ -403,6 +429,75 @@ class MainWindow(QMainWindow):
         self.update_status_label("Action: Break Out (Not Implemented)", "yellow")
         # TODO: Implement Break Out logic
 
+    @pyqtSlot(str)
+    def handle_card_scan(self, card_number):
+        logger.info(f"Card scanned: {card_number}")
+
+        # Check if recognition is paused (e.g., by a recent facial recognition)
+        now = time.time()
+        if self.recognition_paused_until and now < self.recognition_paused_until:
+            logger.info(f"Card scan for {card_number} ignored due to active cooldown.")
+            return
+
+        user_data = self.db_manager.get_user_by_card_number(card_number)
+
+        if user_data:
+            user_id = user_data['id']
+            name = user_data['name']
+            logger.info(f"Card scan matched user: {name} (ID: {user_id})")
+
+            # Cooldown logic for card scans (can be separate or shared)
+            # For simplicity, let's use the existing facial recognition cooldown
+            last_rec_time = self.last_recognition_details.get(f"card_{user_id}", 0) # Use a distinct key for card
+            if now - last_rec_time > config.RECOGNITION_COOLDOWN_SEC:
+                self.last_recognition_details[f"card_{user_id}"] = now
+
+                transaction_id = self.db_manager.add_transaction(user_id, method="card") # Add method
+                if transaction_id:
+                    self.network_manager.queue_transaction(transaction_id)
+                else:
+                    logger.error(f"Failed to log card transaction for user {user_id}")
+
+                hw.activate_relay()
+                self.update_status_label(f"Welcome, {name}! (Card)", "green")
+
+                # Show Accepted Dialog (similar to facial recognition)
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                media_dir = os.path.join(script_dir, 'media')
+                message = f"Welcome, {name}!\n(Card Access)"
+                status = 'accepted'
+                icon_path = os.path.join(media_dir, "accept.png")
+                bg_color = "rgba(173, 216, 230, 200)"
+                sound_path = os.path.join(media_dir, "access accepted.wav")
+
+                if self.current_status_dialog:
+                    self.current_status_dialog.close()
+                self.current_status_dialog = RecognitionStatusDialog(message, status, icon_path, bg_color, sound_path, self)
+                self.current_status_dialog.show()
+                
+                self.pause_processing(config.RECOGNITION_COOLDOWN_SEC) # Pause facial rec
+            else:
+                logger.debug(f"User {name} (Card ID: {card_number}) scanned again within cooldown. Skipping.")
+        else:
+            logger.warning(f"Card scan {card_number} did not match any user.")
+            self.update_status_label("Access Denied: Card Not Registered", "red")
+
+            # Show Rejected Dialog
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            media_dir = os.path.join(script_dir, 'media')
+            message = "Access Rejected: Card Not Registered."
+            status = 'rejected'
+            icon_path = os.path.join(media_dir, "rejected.png")
+            bg_color = "rgba(255, 192, 203, 200)"
+            sound_path = os.path.join(media_dir, "access rejected.wav")
+
+            if self.current_status_dialog:
+                self.current_status_dialog.close()
+            self.current_status_dialog = RecognitionStatusDialog(message, status, icon_path, bg_color, sound_path, self)
+            self.current_status_dialog.show()
+
+            self.pause_processing(config.RECOGNITION_COOLDOWN_SEC) # Pause facial rec
+
     def handle_users_changed(self):
         """Slot connected to the users_changed signal from UserManagementDialog."""
         logger.info("User data changed, reloading known face encodings.")
@@ -446,6 +541,26 @@ class MainWindow(QMainWindow):
         # Short delay before restarting camera
         QTimer.singleShot(500, lambda: self.start_camera(config.PRIMARY_CAMERA_INDEX, config.FPS_LIMIT))
         # Potentially re-apply some settings immediately if needed
+
+    def perform_user_sync(self):
+        logger.info("Attempting periodic user synchronization with backend...")
+        if not getattr(config, 'NETWORK_ENABLED', False) or \
+           not self.network_manager or \
+           not hasattr(self.network_manager, 'sync_users_from_backend'):
+            logger.debug("User synchronization skipped (network disabled, NetworkManager missing, or sync method unavailable).")
+            return
+
+        try:
+            users_updated_result = self.network_manager.sync_users_from_backend()
+            if users_updated_result:
+                logger.info(f"User data synchronized from backend. Reloading local data.")
+                self.handle_users_changed()
+                self.update_status_label("User data updated from server.", "blue")
+            else:
+                logger.info("No user data changes from backend during sync.")
+        except Exception as e:
+            logger.error(f"Error during periodic user synchronization: {e}", exc_info=True)
+            self.update_status_label("Error: User sync failed.", "red")
 
     def closeEvent(self, event):
         """Handle cleanup on window close."""
@@ -626,7 +741,7 @@ class MainWindow(QMainWindow):
                     logger.info(f"Recognized known user: {name} (ID: {user_id}), Distance: {distance:.2f}")
                     self.last_recognition_details[user_id] = now
                     # Log transaction in DB first
-                    transaction_id = self.db_manager.add_transaction(user_id)
+                    transaction_id = self.db_manager.add_transaction(user_id, method="face") # Add method="face"
                     if transaction_id:
                         # Queue the transaction for network upload
                         self.network_manager.queue_transaction(transaction_id)
@@ -699,8 +814,30 @@ class MainWindow(QMainWindow):
         self.update_status_label(f"Recognition paused...", "orange")
         # Ensure the camera feed updates to clear boxes
         if self.current_primary_frame is not None:
-             # self.update_camera_feed(self.current_primary_frame, config.PRIMARY_CAMERA_INDEX)
              self._update_video_label(self.current_primary_frame, [], [], paused=True) # Use new method
+
+    def handle_card_scan(self, card_number):
+        """Handles card scans from the Wiegand reader."""
+        logger.info(f"Card scanned: {card_number}")
+        if self.recognition_paused_until and time.time() < self.recognition_paused_until:
+            logger.info("Card scan ignored due to active cooldown/pause.")
+            # Optionally provide feedback that the system is busy
+            # self.show_temporary_message("System busy, please try again shortly.", duration_ms=2000, is_error=True)
+            return
+
+        user_info = self.db_manager.get_user_by_card_number(card_number)
+
+        if user_info:
+            user_id, name, _ = user_info
+            logger.info(f"Card matched: User {name} (ID: {user_id})")
+            self.db_manager.log_transaction(user_id, "card_scan_accepted", card_number)
+            self.show_recognition_dialog(True, name, card_scan=True)
+            self.pause_processing(config.RECOGNITION_COOLDOWN_SEC) # Pause after card scan too
+        else:
+            logger.warning(f"Card not recognized: {card_number}")
+            self.db_manager.log_transaction(None, "card_scan_rejected", card_number)
+            self.show_recognition_dialog(False, "Unknown Card", card_scan=True)
+            self.pause_processing(config.UNKNOWN_PERSON_COOLDOWN_SEC) # Longer pause for unknown card
 
 
     def update_status_label(self, message, color="white"):
@@ -800,38 +937,121 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Ensure cleanup on application close."""
         logger.info("MainWindow closeEvent triggered. Cleaning up...")
-        self.processing_active = False
-        self.stop_all_cameras()
+        self.processing_active = False # Stop processing first
+
+        # Stop timers
         if hasattr(self, 'ui_update_timer') and self.ui_update_timer.isActive():
             self.ui_update_timer.stop()
             logger.debug("UI Update Timer stopped.")
+        if hasattr(self, 'user_sync_timer') and self.user_sync_timer.isActive():
+            self.user_sync_timer.stop()
+            logger.debug("User Sync Timer stopped.")
+
+        # Stop hardware components (Wiegand Reader)
+        if hasattr(self, 'wiegand_reader') and self.wiegand_reader:
+            if hasattr(self.wiegand_reader, 'stop'):
+                logger.debug("Stopping Wiegand reader...")
+                self.wiegand_reader.stop()
+                logger.debug("Wiegand reader stopped.")
+            else:
+                logger.warning("Wiegand reader does not have a stop method.")
+
+        # Stop threads (Worker, NetworkManager)
         if hasattr(self, 'worker_thread') and self.worker_thread.isRunning():
             logger.debug("Stopping worker thread...")
-            self.worker_thread.quit() # Ask thread's event loop to exit
-            if not self.worker_thread.wait(2000): # Wait up to 2 seconds
+            self.worker_thread.quit()
+            if not self.worker_thread.wait(2000):
                  logger.warning("Worker thread did not finish quitting gracefully. Forcing termination.")
-                 self.worker_thread.terminate() # Force if necessary
-                 self.worker_thread.wait() # Wait after terminate
+                 self.worker_thread.terminate()
+                 self.worker_thread.wait()
             logger.debug("Worker thread stopped.")
+
         if hasattr(self, 'network_manager') and hasattr(self.network_manager, 'stop'):
              logger.debug("Stopping network manager...")
-             self.network_manager.stop() # Assumes network_manager has a stop method that joins its thread
+             self.network_manager.stop()
              logger.debug("Network manager stopped.")
+
+        # Close dialogs
         if hasattr(self, 'welcome_dialog') and self.welcome_dialog:
             self.welcome_dialog.close()
             logger.debug("Welcome dialog closed.")
+        if hasattr(self, 'current_status_dialog') and self.current_status_dialog and self.current_status_dialog.isVisible():
+            self.current_status_dialog.close()
+            logger.debug("Current status dialog closed.")
 
-        # Ensure all camera threads are really finished (belt and suspenders)
-        # for index, thread in list(self.camera_threads.items()):
-        #     if thread.isRunning():
-        #         thread.wait(500) # Give final chance to stop
-        #         if thread.isRunning():
-        #             logger.warning(f"Camera thread {index} did not stop, terminating.")
-        #             thread.terminate()
+        # Quit Pygame mixer
+        if 'pygame.mixer' in sys.modules and pygame.mixer.get_init():
+            pygame.mixer.quit()
+            logger.info("Pygame mixer quit.")
+        
+        # Stop and wait for all camera threads
+        logger.info("Stopping and waiting for all camera threads...")
+        self.stop_all_cameras() # Signals all camera threads to stop
+        
+        # Create a list of threads to wait for to avoid issues with dict changing during iteration
+        threads_to_wait_for = list(self.camera_threads.values())
+        for thread in threads_to_wait_for:
+            if thread.isRunning():
+                cam_idx = getattr(thread, 'camera_index', 'N/A')
+                logger.debug(f"Waiting for camera thread (index: {cam_idx}) to finish...")
+                if not thread.wait(1500): # Wait for 1.5 seconds
+                    logger.warning(f"Camera thread (index: {cam_idx}) did not finish gracefully. Terminating.")
+                    thread.terminate()
+                    thread.wait() # Wait after terminate
+        logger.info("All camera threads processed for shutdown.")
 
         logger.info("Cleanup complete. Exiting application.")
-        # QApplication.quit() # This can sometimes cause issues if called directly in closeEvent
-        event.accept() # Accept the close event
+        event.accept()
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    # Configure logging BEFORE creating QApplication for early logs if needed
+    # logging.basicConfig(...) # Already done above
+
+    app = QApplication(sys.argv)
+    # Apply a style maybe?
+    # app.setStyle('Fusion')
+
+    main_window = MainWindow()
+    main_window.show() # Show the window loaded from the UI file
+
+    exit_code = app.exec()
+    logger.info(f"Application exiting with code {exit_code}")
+    sys.exit(exit_code) # Ensure exit code is propagated
+
+    self.processing_active = False
+    self.stop_all_cameras()
+    if hasattr(self, 'ui_update_timer') and self.ui_update_timer.isActive():
+        self.ui_update_timer.stop()
+        logger.debug("UI Update Timer stopped.")
+    if hasattr(self, 'worker_thread') and self.worker_thread.isRunning():
+        logger.debug("Stopping worker thread...")
+        self.worker_thread.quit() # Ask thread's event loop to exit
+        if not self.worker_thread.wait(2000): # Wait up to 2 seconds
+                logger.warning("Worker thread did not finish quitting gracefully. Forcing termination.")
+                self.worker_thread.terminate() # Force if necessary
+                self.worker_thread.wait() # Wait after terminate
+        logger.debug("Worker thread stopped.")
+    if hasattr(self, 'network_manager') and hasattr(self.network_manager, 'stop'):
+            logger.debug("Stopping network manager...")
+            self.network_manager.stop() # Assumes network_manager has a stop method that joins its thread
+            logger.debug("Network manager stopped.")
+    if hasattr(self, 'welcome_dialog') and self.welcome_dialog:
+        self.welcome_dialog.close()
+        logger.debug("Welcome dialog closed.")
+
+    # Ensure all camera threads are really finished (belt and suspenders)
+    # for index, thread in list(self.camera_threads.items()):
+    #     if thread.isRunning():
+    #         thread.wait(500) # Give final chance to stop
+    #         if thread.isRunning():
+    #             logger.warning(f"Camera thread {index} did not stop, terminating.")
+    #             thread.terminate()
+
+    logger.info("Cleanup complete. Exiting application.")
+    # QApplication.quit() # This can sometimes cause issues if called directly in closeEvent
+    event.accept() # Accept the close event
 
 
 # --- Main Execution ---

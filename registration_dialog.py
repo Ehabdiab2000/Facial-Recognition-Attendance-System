@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdi
                              QPushButton, QMessageBox, QWidget,QApplication)
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import pyqtSlot
 
 # Assuming face_processor handles encoding generation
 from face_processor import FaceProcessor
@@ -19,10 +20,11 @@ logger = logging.getLogger(__name__)
 class RegistrationDialog(QDialog):
     user_registered = pyqtSignal() # Signal emitted when user is successfully registered
 
-    def __init__(self, db_manager, face_processor: FaceProcessor, parent=None, edit_user_id=None):
+    def __init__(self, db_manager, face_processor: FaceProcessor, parent=None, edit_user_id=None, wiegand_reader_instance=None):
         super().__init__(parent)
         self.db_manager = db_manager
         self.face_processor = face_processor
+        self.wiegand_reader_instance = wiegand_reader_instance
         self.setWindowTitle("Register New User" if edit_user_id is None else "Edit User")
         self.setModal(True) # Block main window interaction
 
@@ -31,9 +33,21 @@ class RegistrationDialog(QDialog):
         self.captured_encoding = None
         self.face_location = None # Store location of the face used for encoding
         self.edit_user_id = edit_user_id # Track if we're editing an existing user
+        self.original_card_number = None # To check if card number changed during edit
 
         # UI Elements
-        self._setup_ui()
+        self._setup_ui() # Call before loading data if editing
+
+        if self.edit_user_id:
+            self.load_user_data_for_editing()
+
+        # If Wiegand reader is passed, connect its signal to populate the card field
+        if self.wiegand_reader_instance:
+            try:
+                self.wiegand_reader_instance.card_scanned.connect(self.on_card_scanned_in_dialog)
+            except Exception as e:
+                logger.error(f"Error connecting Wiegand signal in RegistrationDialog: {e}")
+
 
         # On-Screen Keyboard
         self.keyboard = OnScreenKeyboard()
@@ -42,6 +56,7 @@ class RegistrationDialog(QDialog):
         # Connect keyboard focus
         self.name_input.installEventFilter(self)
         self.details_input.installEventFilter(self)
+        self.card_input.installEventFilter(self) # Add card_input to event filter
         self.keyboard.set_target_lineEdit(self.name_input) # Default target
 
         # Camera Feed Setup (Use a separate thread or timer for preview)
@@ -85,6 +100,14 @@ class RegistrationDialog(QDialog):
         input_layout.addWidget(self.details_label)
         input_layout.addWidget(self.details_input)
 
+        # --- Add Card Number Field ---
+        self.card_label = QLabel("Card Number:")
+        self.card_input = QLineEdit()
+        self.card_input.setPlaceholderText("Enter or scan card number")
+        input_layout.addWidget(self.card_label)
+        input_layout.addWidget(self.card_input)
+        # -----------------------------
+
         form_layout.addLayout(input_layout)
 
         # Action Buttons Layout
@@ -103,8 +126,12 @@ class RegistrationDialog(QDialog):
 
         # Dialog Buttons (Save/Cancel)
         button_layout = QHBoxLayout()
-        self.save_button = QPushButton("Save User")
-        self.save_button.setEnabled(False) # Disabled until face is captured
+        self.save_button = QPushButton("Save User" if self.edit_user_id is None else "Update User")
+        # Enable save button if editing existing user, or if face captured for new
+        if self.edit_user_id:
+            self.save_button.setEnabled(True)
+        else:
+            self.save_button.setEnabled(False) # Only enable after face capture for new user
         self.save_button.clicked.connect(self.save_user)
         button_layout.addWidget(self.save_button)
 
@@ -121,6 +148,8 @@ class RegistrationDialog(QDialog):
                 self.keyboard.set_target_lineEdit(self.name_input)
             elif source is self.details_input:
                 self.keyboard.set_target_lineEdit(self.details_input)
+            elif source is self.card_input: # Add card_input to keyboard target
+                self.keyboard.set_target_lineEdit(self.card_input)
         return super().eventFilter(source, event)
 
     def _start_registration_camera(self):
@@ -244,59 +273,99 @@ class RegistrationDialog(QDialog):
         self.captured_encoding = face_encodings[0] # Get the first (and only) encoding
         self.face_location = face_locations[0] # Store location for visual feedback
         self.status_label.setText("Status: Face captured successfully! Enter details and save.")
-        self.save_button.setEnabled(True)
+        # If capturing a face for a new user, save button is enabled
+        if self.captured_encoding is not None and self.edit_user_id is None:
+            self.save_button.setEnabled(True)
+        elif self.edit_user_id is not None: # If editing, save is already enabled, capture is optional
+             self.save_button.setEnabled(True) # Ensure it stays enabled
         logger.info("Face encoding captured successfully for registration.")
 
         # Update preview immediately to show the captured face box
         self._update_preview_frame(self.current_frame, config.PRIMARY_CAMERA_INDEX)
 
 
+    def load_user_data_for_editing(self):
+        if self.edit_user_id is None:
+            return
+        user_data = self.db_manager.get_user_by_id(self.edit_user_id)
+        if user_data:
+            self.name_input.setText(user_data['name'])
+            self.details_input.setText(user_data['details'] or "")
+            self.card_input.setText(user_data['card_number'] or "")
+            self.original_card_number = user_data['card_number'] # Store for checking changes
+            # Note: Face encoding is not pre-loaded; user must re-capture if they want to change it.
+            self.status_label.setText("Editing user. Capture new face to update or save existing details.")
+        else:
+            QMessageBox.critical(self, "Error", f"Could not load data for user ID {self.edit_user_id}.")
+            self.reject() # Close if user not found
+
+    @pyqtSlot(str) # Slot to receive card number
+    def on_card_scanned_in_dialog(self, card_number):
+        # This slot is active only when the dialog is open
+        if self.isVisible(): # Check if dialog is currently visible
+            logger.info(f"Card scanned in registration dialog: {card_number}")
+            self.card_input.setText(card_number)
+            # Optionally, provide feedback to the user
+            # QMessageBox.information(self, "Card Scanned", f"Card Number: {card_number} captured.")
+
     def save_user(self):
         """Validates input and saves the user to the database."""
         name = self.name_input.text().strip()
         details = self.details_input.text().strip()
+        card_number = self.card_input.text().strip() # Get card number
 
         if not name:
             QMessageBox.warning(self, "Input Error", "Name cannot be empty.")
             return
 
-        if self.captured_encoding is None and self.edit_user_id is None:
-            QMessageBox.warning(self, "Input Error", "No face encoding has been captured.")
+        # If new user, face encoding is mandatory
+        if self.edit_user_id is None and self.captured_encoding is None:
+            QMessageBox.warning(self, "Input Error", "No face encoding has been captured for new user.")
             return
 
-        # Confirmation dialog (optional but recommended)
         action = "update" if self.edit_user_id else "register"
-        reply = QMessageBox.question(self, 'Confirm Save',
-                                       f"{action.capitalize()} user '{name}' with the captured face?",
-                                       QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel,
-                                       QMessageBox.StandardButton.Cancel)
+        confirm_msg = f"{action.capitalize()} user '{name}'?"
+        if self.captured_encoding is not None and self.captured_encoding.any():
+            confirm_msg += " (Face will be updated/set)"
+        if card_number:
+            confirm_msg += f" (Card: {card_number})"
+        elif self.edit_user_id and self.original_card_number and not card_number:
+             confirm_msg += f" (Card will be REMOVED)"
 
+
+        reply = QMessageBox.question(self, 'Confirm Save', confirm_msg,
+                                       QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel)
         if reply == QMessageBox.StandardButton.Save:
+            success = False
             if self.edit_user_id:
                 # Update existing user
-                success = self.db_manager.update_user_details(self.edit_user_id, name, details)
-                if self.captured_encoding is not None:
-                    success = success and self.db_manager.update_user_encoding(self.edit_user_id, self.captured_encoding)
+                # Pass card_number to update_user_details
+                success = self.db_manager.update_user_details(self.edit_user_id, name, details, card_number)
+                if self.captured_encoding is not None: # Only update encoding if a new one was captured
+                    encoding_success = self.db_manager.update_user_encoding(self.edit_user_id, self.captured_encoding)
+                    success = success and encoding_success # Combine success flags
                 if success:
                     QMessageBox.information(self, "Success", f"User '{name}' updated successfully!")
-                    self.face_processor.load_known_faces()
-                    self.user_registered.emit()
-                    self.accept()
                 else:
-                    QMessageBox.critical(self, "Database Error", f"Failed to update user '{name}'.")
-            else:
-                # Add new user
-                user_id = self.db_manager.add_user(name, details, self.captured_encoding)
+                    # Check if it was a card number conflict
+                    # This requires db_manager.update_user_details to indicate this specific error
+                    # For now, a generic message or check self.db_manager for last error if possible
+                    QMessageBox.critical(self, "Database Error", f"Failed to update user '{name}'. Card number might be in use by another user, or another error occurred.")
+            else: # Add new user
+                # Pass card_number to add_user
+                user_id = self.db_manager.add_user(name, details, self.captured_encoding, card_number)
                 if user_id:
+                    success = True
                     QMessageBox.information(self, "Success", f"User '{name}' registered successfully!")
-                    self.face_processor.load_known_faces()
-                    self.user_registered.emit()
-                    self.accept()
                 else:
-                    QMessageBox.critical(self, "Database Error", f"Failed to save user '{name}' to the database.")
+                    QMessageBox.critical(self, "Database Error", f"Failed to save user '{name}'. Card number might already exist or another error occurred.")
+
+            if success:
+                self.face_processor.load_known_faces() # Reload known faces for main app
+                self.user_registered.emit() # Signal that a user was added/updated
+                self.accept() # Close dialog
         else:
              logger.info("User save cancelled by user.")
-
 
     def closeEvent(self, event):
         """Ensure camera thread is stopped when dialog closes."""
@@ -308,4 +377,12 @@ class RegistrationDialog(QDialog):
     def reject(self):
         logger.debug("RegistrationDialog reject triggered.")
         self._stop_registration_camera()
+        # Disconnect Wiegand reader signal if connected
+        if self.wiegand_reader_instance:
+            try:
+                self.wiegand_reader_instance.card_scanned.disconnect(self.on_card_scanned_in_dialog)
+            except TypeError: # Raised if not connected or already disconnected
+                logger.debug("Wiegand signal already disconnected or was not connected in reject.")
+            except Exception as e:
+                logger.error(f"Error disconnecting Wiegand signal in reject: {e}")
         super().reject()
